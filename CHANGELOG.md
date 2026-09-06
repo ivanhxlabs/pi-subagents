@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0-ivanhxlabs.3] - 2026-09-06
+
 ### Fixed
 - **Schema-bearing workflow children no longer require redundant final prose after valid structured output.** A clean empty `stop` after an accepted `StructuredOutput` payload now succeeds for ordinary and strict workflow agents, while provider, token-limit, tool, and schema failures remain terminal. ([ivanhxlabs/skills#162](https://github.com/ivanhxlabs/skills/issues/162))
 
@@ -791,7 +793,8 @@ Initial release.
 - **Thinking level** — per-agent extended thinking control
 - **`/agent` and `/agents` commands**
 
-[Unreleased]: https://github.com/ivanhxlabs/pi-subagents/compare/v0.19.0-ivanhxlabs.2...HEAD
+[Unreleased]: https://github.com/ivanhxlabs/pi-subagents/compare/v0.19.0-ivanhxlabs.3...HEAD
+[0.19.0-ivanhxlabs.3]: https://github.com/ivanhxlabs/pi-subagents/compare/v0.19.0-ivanhxlabs.2...v0.19.0-ivanhxlabs.3
 [0.19.0-ivanhxlabs.2]: https://github.com/ivanhxlabs/pi-subagents/compare/v0.19.0-ivanhxlabs.1...v0.19.0-ivanhxlabs.2
 [0.19.0-ivanhxlabs.1]: https://github.com/ivanhxlabs/pi-subagents/compare/v0.19.0...v0.19.0-ivanhxlabs.1
 [0.6.3]: https://github.com/tintinweb/pi-subagents/compare/v0.6.2...v0.6.3

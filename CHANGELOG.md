@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Strict Pi compatibility now recognises the installed host bundle's minified preflight booleans.** Pi 0.85.1 bundles `true` and `false` as `!0` and `!1`; the source-shape guard previously accepted only unminified literals, so `strictAgent()` failed closed as `INCOMPATIBLE_PI_RUNTIME` before every route attempt even though the required preflight boundary was present. The release promotion now executes an offline exact-tag strict preflight through the installed Pi CLI so this host/package mismatch cannot pass on extension loading alone. ([ivanhxlabs/skills#159](https://github.com/ivanhxlabs/skills/issues/159))
+
 ## [0.19.0-ivanhxlabs.1] - 2026-09-06
 
 ### Added

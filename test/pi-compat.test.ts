@@ -19,6 +19,21 @@ describe("strict Pi compatibility adapter", () => {
     expect(strictPiCompatibilityError(registry(compatibleRuntime))).toBeUndefined();
   });
 
+  it("accepts the installed Pi bundle's minified boolean preflight callbacks", () => {
+    async function prompt(this: { _runAgentPrompt(): Promise<void> }) {
+      const preflightResult = (_success: boolean) => {};
+      try {
+        preflightResult?.(!1);
+      } catch {
+        preflightResult?.(!1);
+      }
+      preflightResult?.(!0);
+      await this._runAgentPrompt();
+    }
+
+    expect(strictPiCompatibilityError(registry(compatibleRuntime), prompt)).toBeUndefined();
+  });
+
   it("exposes only a structurally compatible canonical model runtime", () => {
     expect(strictModelRuntime(registry(compatibleRuntime))).toBe(compatibleRuntime);
     expect(strictModelRuntime(registry({ getModel() {} }))).toBeUndefined();

@@ -1,6 +1,6 @@
 import { AgentSession } from "@earendil-works/pi-coding-agent";
-const TRUE_PREFLIGHT = /preflightResult\s*\?\.\s*\(\s*true\s*\)/g;
-const FALSE_PREFLIGHT = /preflightResult\s*\?\.\s*\(\s*false\s*\)/;
+const TRUE_PREFLIGHT = /preflightResult\s*\?\.\s*\(\s*(?:true|!\s*0)\s*\)/g;
+const FALSE_PREFLIGHT = /preflightResult\s*\?\.\s*\(\s*(?:false|!\s*1)\s*\)/;
 const AGENT_PROMPT_HANDOFF = /this\._runAgentPrompt\s*\(/;
 function isCompatibleModelRuntime(value) {
     if (typeof value !== "object" || value === null)

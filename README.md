@@ -49,7 +49,7 @@ pi install git:github.com/ivanhxlabs/pi-subagents@latest
 For a provenance-pinned installation, use the immutable signed release tag:
 
 ```bash
-pi install git:github.com/ivanhxlabs/pi-subagents@v0.19.0-ivanhxlabs.1
+pi install git:github.com/ivanhxlabs/pi-subagents@v0.19.0-ivanhxlabs.2
 ```
 
 Do not configure the stock npm package and this fork together: both register the same extension tools. The mutable `latest` tag only moves after the immutable release passes the promotion workflow.

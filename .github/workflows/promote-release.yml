@@ -88,11 +88,12 @@ jobs:
           set -euo pipefail
 
           source="git:github.com/ivanhxlabs/pi-subagents@${RELEASE_TAG}"
-          pi_cli=(npx --yes @earendil-works/pi-coding-agent@0.85.1)
+          pi_cli="$GITHUB_WORKSPACE/node_modules/.bin/pi"
+          test "$("$pi_cli" --version)" = "0.85.1"
 
-          "${pi_cli[@]}" install "$source"
-          "${pi_cli[@]}" list | tee "$RUNNER_TEMP/pi-list.txt"
-          "${pi_cli[@]}" --help > "$RUNNER_TEMP/pi-help.txt"
+          "$pi_cli" install "$source"
+          "$pi_cli" list | tee "$RUNNER_TEMP/pi-list.txt"
+          "$pi_cli" --help > "$RUNNER_TEMP/pi-help.txt"
 
           jq -e --arg source "$source" '.packages == [$source]' \
             "$PI_CODING_AGENT_DIR/settings.json" >/dev/null
@@ -103,6 +104,8 @@ jobs:
           test -z "$(git -C "$checkout" status --short)"
           test "$(node -p "require('$checkout/package.json').version")" \
             = "${RELEASE_TAG#v}"
+          node "$checkout/scripts/verify-installed-strict-preflight.mjs" "$pi_cli" \
+            | tee "$RUNNER_TEMP/strict-preflight.json"
 
       - name: Move the latest update channel
         env:

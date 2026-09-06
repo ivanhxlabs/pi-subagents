@@ -1349,6 +1349,86 @@ describe("agent-runner master tool allowlist", () => {
       expect(session.prompt).toHaveBeenCalledTimes(1);
     });
 
+    it("accepts a valid StructuredOutput followed by an empty clean stop", async () => {
+      vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true }));
+      vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: true }));
+      vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+      withExtensions({ "/ext/ok.ts": ["ok_ext"] });
+      const { session } = createSession("");
+      createAgentSession.mockResolvedValue({ session });
+
+      session.prompt.mockImplementation(async () => {
+        session.messages.push({
+          role: "assistant",
+          content: [{
+            type: "toolCall",
+            id: "so-codex-1",
+            name: "StructuredOutput",
+            arguments: { answer: "42" },
+          }],
+          stopReason: "toolUse",
+        });
+        await customTool("StructuredOutput").execute("so-codex-1", { answer: "42" });
+        session.messages.push(
+          {
+            role: "toolResult",
+            toolCallId: "so-codex-1",
+            toolName: "StructuredOutput",
+            content: [{ type: "text", text: "Recorded." }],
+            isError: false,
+          },
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "" }],
+            stopReason: "stop",
+          },
+        );
+      });
+
+      const result = await runAgent(ctx, "Explore", "go", { pi, structuredOutput: STRUCTURED });
+
+      expect(result.structuredJson).toBe(JSON.stringify({ answer: "42" }));
+      expect(result.responseText).toBe("");
+      expect(result.failure).toBeUndefined();
+      expect(result.structuredRetried).toBeUndefined();
+      expect(session.prompt).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      [
+        "a provider error",
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "" }],
+          stopReason: "error",
+          errorMessage: "retries exhausted: 529 overloaded",
+        },
+        "retries exhausted: 529 overloaded",
+      ],
+      [
+        "empty token-limit exhaustion",
+        { role: "assistant", content: [], stopReason: "length" },
+        "run hit the output token limit before producing any text",
+      ],
+    ])("does not let valid StructuredOutput hide %s", async (_label, finalMessage, expectedFailure) => {
+      vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true }));
+      vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: true }));
+      vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+      withExtensions({ "/ext/ok.ts": ["ok_ext"] });
+      const { session } = createSession("");
+      createAgentSession.mockResolvedValue({ session });
+
+      session.prompt.mockImplementation(async () => {
+        await customTool("StructuredOutput").execute("so-terminal-1", { answer: "42" });
+        session.messages.push(finalMessage);
+      });
+
+      const result = await runAgent(ctx, "Explore", "go", { pi, structuredOutput: STRUCTURED });
+
+      expect(result.structuredJson).toBe(JSON.stringify({ answer: "42" }));
+      expect(result.failure).toBe(expectedFailure);
+    });
+
     it("prompts once more when the child answered in prose, and fails if it still does", async () => {
       vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true }));
       vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: true }));
@@ -2887,6 +2967,125 @@ describe("strict agent runner evidence", () => {
       "TOOL_FAILED",
       expect.stringContaining('Tool "bash" failed'),
     );
+  });
+
+  it("does not let an empty stop after StructuredOutput hide an unrecovered tool failure", async () => {
+    const { session, listeners } = strictSession();
+    const observer = strictObserver();
+    session.prompt.mockImplementation(async (_text: string, options: { preflightResult?: (success: boolean) => void }) => {
+      options.preflightResult?.(true);
+      for (const listener of listeners) {
+        listener({ type: "agent_start" });
+        listener({ type: "message_start", message: { role: "assistant" } });
+      }
+      await customTool("StructuredOutput").execute("so-before-failure", { answer: "42" });
+      for (const listener of listeners) {
+        listener({ type: "tool_execution_start", toolName: "bash" });
+        listener({ type: "tool_execution_end", toolName: "bash", isError: true });
+        listener({ type: "message_start", message: { role: "assistant" } });
+        listener({
+          type: "message_end",
+          message: { role: "assistant", content: [{ type: "text", text: "" }], stopReason: "stop" },
+        });
+      }
+      session.messages.push({
+        role: "assistant",
+        content: [{ type: "text", text: "" }],
+        stopReason: "stop",
+      });
+    });
+
+    const result = await runAgent(ctx, "Explore", "go", {
+      pi,
+      strictAttempt: observer,
+      structuredOutput: STRUCTURED,
+    });
+
+    expect(result.structuredJson).toBe(JSON.stringify({ answer: "42" }));
+    expect(result.failure).toContain('Tool "bash" failed');
+    expect(observer.onFailure).toHaveBeenCalledWith(
+      "TOOL_FAILED",
+      expect.stringContaining('Tool "bash" failed'),
+    );
+  });
+
+  it("clears a tool failure after a later assistant turn produces recovery output", async () => {
+    const { session, listeners } = strictSession();
+    const observer = strictObserver();
+    session.prompt.mockImplementation(async (_text: string, options: { preflightResult?: (success: boolean) => void }) => {
+      options.preflightResult?.(true);
+      for (const listener of listeners) {
+        listener({ type: "agent_start" });
+        listener({ type: "message_start", message: { role: "assistant" } });
+        listener({ type: "tool_execution_start", toolName: "bash" });
+        listener({ type: "tool_execution_end", toolName: "bash", isError: true });
+        listener({ type: "message_start", message: { role: "assistant" } });
+        listener({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "recovered" }],
+            stopReason: "stop",
+          },
+        });
+      }
+      session.messages.push({
+        role: "assistant",
+        content: [{ type: "text", text: "recovered" }],
+        stopReason: "stop",
+      });
+    });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi, strictAttempt: observer });
+
+    expect(result.responseText).toBe("recovered");
+    expect(result.failure).toBeUndefined();
+    expect(observer.onFailure).not.toHaveBeenCalled();
+  });
+
+  it("clears a tool failure when a later assistant turn takes another tool action", async () => {
+    const { session, listeners } = strictSession();
+    const observer = strictObserver();
+    session.prompt.mockImplementation(async (_text: string, options: { preflightResult?: (success: boolean) => void }) => {
+      options.preflightResult?.(true);
+      for (const listener of listeners) {
+        listener({ type: "agent_start" });
+        listener({ type: "message_start", message: { role: "assistant" } });
+        listener({ type: "tool_execution_start", toolName: "bash" });
+        listener({ type: "tool_execution_end", toolName: "bash", isError: true });
+        listener({ type: "message_start", message: { role: "assistant" } });
+        listener({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{
+              type: "toolCall",
+              id: "read-after-failure",
+              name: "read",
+              arguments: { path: "README.md" },
+            }],
+            stopReason: "toolUse",
+          },
+        });
+        listener({ type: "tool_execution_start", toolName: "read" });
+        listener({ type: "tool_execution_end", toolName: "read", isError: false });
+      }
+      session.messages.push({
+        role: "assistant",
+        content: [{
+          type: "toolCall",
+          id: "read-after-failure",
+          name: "read",
+          arguments: { path: "README.md" },
+        }],
+        stopReason: "toolUse",
+      });
+    });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi, strictAttempt: observer });
+
+    expect(result.failure).toBeUndefined();
+    expect(observer.onFailure).not.toHaveBeenCalled();
   });
 
   it("classifies a throw after final preflight as a terminal runtime failure", async () => {

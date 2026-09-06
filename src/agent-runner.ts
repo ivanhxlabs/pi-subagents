@@ -588,8 +588,9 @@ function getLastAssistantText(session: AgentSession, startIndex = 0): string {
  *     the output-token ceiling before writing anything, which would otherwise
  *     land as a "completed" run with an empty result (the #144 symptom).
  *   - any non-"toolUse" stop with NO text: the model ended its final turn
- *     without writing output — a "stop"/"end_turn" final with an empty text
- *     block must not report "completed" with a stale fallback answer.
+ *     without writing output — a "stop" final with an empty text block must not
+ *     report "completed" with a stale fallback answer, unless a schema-bearing
+ *     run already captured its answer through StructuredOutput.
  * Everything else completes: a "toolUse" stop (never final), and — crucially — a
  * "length" or "stop" stop that DID produce text (a legitimate truncated or
  * concluding answer).
@@ -600,23 +601,26 @@ function getLastAssistantText(session: AgentSession, startIndex = 0): string {
 function finalTurnFailure(
   session: AgentSession,
   startIndex = 0,
+  acceptEmptyCleanStop = false,
 ): { message: string; strictCode: "PROVIDER_FAILED" | "CHILD_FAILED" } | undefined {
   for (let i = session.messages.length - 1; i >= startIndex; i--) {
     const msg = session.messages[i];
     if (msg.role !== "assistant") continue;
+    const text = extractText(msg.content).trim();
     if (msg.stopReason === "error") {
       return {
         message: (msg as { errorMessage?: string }).errorMessage?.trim() || "provider error with no output",
         strictCode: "PROVIDER_FAILED",
       };
     }
-    if (msg.stopReason === "length" && !extractText(msg.content).trim()) {
+    if (msg.stopReason === "length" && !text) {
       return {
         message: "run hit the output token limit before producing any text",
         strictCode: "PROVIDER_FAILED",
       };
     }
-    if (msg.stopReason !== "toolUse" && !extractText(msg.content).trim()) {
+    if (acceptEmptyCleanStop && msg.stopReason === "stop" && !text) return undefined;
+    if (msg.stopReason !== "toolUse" && !text) {
       return {
         message: "run ended without producing any text",
         strictCode: "CHILD_FAILED",
@@ -1155,7 +1159,10 @@ export async function runAgent(
   let aborted = false;
 
   let currentMessageText = "";
-  let terminalStrictToolFailure: string | undefined;
+  let terminalStrictToolFailure: {
+    message: string;
+    assistantMessageStartedCount: number;
+  } | undefined;
   const unsubTurns = session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "agent_start") strictAgentStartCount++;
     if (event.type === "turn_end") {
@@ -1174,9 +1181,6 @@ export async function runAgent(
     if (event.type === "message_start") {
       currentMessageText = "";
       if (event.message.role === "assistant") {
-        // A later assistant turn means it observed and recovered from any tool
-        // error in the preceding turn. Only an unrecovered final error is terminal.
-        terminalStrictToolFailure = undefined;
         reportStrictEvidence({
           assistantMessageStartedCount: strictEvidence.assistantMessageStartedCount + 1,
         });
@@ -1199,11 +1203,28 @@ export async function runAgent(
     }
     if (event.type === "tool_execution_end") {
       if (options.strictAttempt !== undefined && event.isError) {
-        terminalStrictToolFailure = `Tool "${event.toolName}" failed before the strict attempt settled.`;
+        terminalStrictToolFailure = {
+          message: `Tool "${event.toolName}" failed before the strict attempt settled.`,
+          assistantMessageStartedCount: strictEvidence.assistantMessageStartedCount,
+        };
       }
       options.onToolActivity?.({ type: "end", toolName: event.toolName });
     }
     if (event.type === "message_end" && event.message.role === "assistant") {
+      // A later assistant turn clears a preceding tool failure only when it
+      // produces text or takes another tool action. Merely starting and ending
+      // an empty turn does not demonstrate recovery.
+      if (
+        terminalStrictToolFailure !== undefined
+        && strictEvidence.assistantMessageStartedCount
+          > terminalStrictToolFailure.assistantMessageStartedCount
+        && (
+          extractText(event.message.content).trim()
+          || event.message.stopReason === "toolUse"
+        )
+      ) {
+        terminalStrictToolFailure = undefined;
+      }
       const u = (event.message as any).usage;
       if (u) options.onAssistantUsage?.({
         input: u.input ?? 0,
@@ -1296,18 +1317,23 @@ export async function runAgent(
       ? `The agent's StructuredOutput call did not match the required schema: ${structuredCapture.lastError}`
       : "The agent did not report its answer through StructuredOutput."
     : undefined;
-  const turnFailure = finalTurnFailure(session, startLen);
+  const turnFailure = finalTurnFailure(
+    session,
+    startLen,
+    structuredCapture?.json !== undefined,
+  );
   if (options.signal?.aborted) reportStrictFailure("CANCELLED", "Strict attempt cancelled.");
   else if (structuredFailure !== undefined) reportStrictFailure("SCHEMA_REJECTED", structuredFailure);
-  else if (terminalStrictToolFailure !== undefined) reportStrictFailure("TOOL_FAILED", terminalStrictToolFailure);
-  else if (turnFailure !== undefined) reportStrictFailure(turnFailure.strictCode, turnFailure.message);
+  else if (terminalStrictToolFailure !== undefined) {
+    reportStrictFailure("TOOL_FAILED", terminalStrictToolFailure.message);
+  } else if (turnFailure !== undefined) reportStrictFailure(turnFailure.strictCode, turnFailure.message);
   else if (aborted) reportStrictFailure("CHILD_FAILED", "Strict attempt exceeded its turn limit.");
   return {
     responseText,
     session,
     aborted,
     steered: softLimitReached,
-    failure: turnFailure?.message ?? structuredFailure ?? terminalStrictToolFailure,
+    failure: turnFailure?.message ?? structuredFailure ?? terminalStrictToolFailure?.message,
     ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
     ...(structuredRetried ? { structuredRetried } : {}),
   };

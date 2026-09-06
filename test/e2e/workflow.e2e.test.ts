@@ -338,8 +338,11 @@ describe("Workflow end to end", () => {
         const isParent = (context.tools ?? []).some(t => t.name === "SubagentWorkflow");
         if (!isParent) {
           const text = asText(context);
+          // OpenAI Codex ends the turn this way after StructuredOutput returns
+          // `Recorded.`: a clean `stop` with an empty text block. The payload is
+          // already the answer; requiring redundant prose would reject it.
           return text.includes("Recorded.")
-            ? fauxText("done")
+            ? fauxText("")
             : fauxToolCall("StructuredOutput", { answer: "structured" }, { id: "strict-so-1" });
         }
         return asText(context).includes("Task ID")
@@ -556,13 +559,15 @@ describe.runIf(LIVE)("Workflow end to end (live LLM, opt-in)", () => {
   );
 
   it(
-    "a schema-bearing agent answers through StructuredOutput against a real provider",
+    "accepts a real provider's valid StructuredOutput without requiring final prose",
     async () => {
       // The one path a faux backend genuinely cannot stand in for. `schema`
       // rests on `constrainedSampling` reaching the provider's own constrained
       // decoding, plus a description, a guideline and host-side validation
       // behind it — a faux model answers because the harness told it to, so
-      // nothing below the tool call is exercised there.
+      // nothing below the tool call is exercised there. OpenAI Codex currently
+      // follows the accepted tool call with a clean empty stop; journal success
+      // therefore proves the payload stands on its own rather than needing prose.
       const script = [
         'export const meta = { name: "live-schema", description: "one structured answer" };',
         "const picked = await agent(",

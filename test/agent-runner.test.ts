@@ -460,7 +460,10 @@ describe("agent-runner failed-final-turn detection (#144)", () => {
     expect(result.responseText).toBe("truncated but useful answer");
   });
 
-  it("does NOT flag an empty final turn that stopped cleanly (no false failures)", async () => {
+  it("flags an empty final turn that stopped cleanly even when an EARLIER message had text", async () => {
+    // Pre-fix this passed as "completed": the terminal "stop" with no text
+    // slipped through, and the walk-back fallback surfaced the earlier
+    // "did the work" as the result. An empty terminal stop is a no-output run.
     const session = sessionEnding(
       { role: "assistant", content: [{ type: "text", text: "did the work" }] },
       { role: "toolResult", content: [] },
@@ -470,8 +473,50 @@ describe("agent-runner failed-final-turn detection (#144)", () => {
 
     const result = await runAgent(ctx, "Explore", "go", { pi });
 
-    expect(result.failure).toBeUndefined();
+    expect(result.failure).toBe("run ended without producing any text");
     expect(result.responseText).toBe("did the work"); // walk-back fallback preserved
+  });
+
+  it("flags a final clean stop whose text block is empty (the stale-result hole)", async () => {
+    // Observed on long opus runs: the final assistant message is
+    // content: [{ type: "thinking", ... }, { type: "text", text: "" }] with
+    // stopReason "stop". The empty text block used to pass as "completed" and
+    // the walk-back fallback surfaced the run's OPENING line as the result.
+    const session = sessionEnding({
+      role: "assistant",
+      content: [{ type: "thinking", thinking: "…" }, { type: "text", text: "" }],
+      stopReason: "stop",
+    });
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(result.failure).toBe("run ended without producing any text");
+    expect(result.responseText).toBe("");
+  });
+
+  it("does NOT flag a clean stop that produced text", async () => {
+    const session = sessionEnding({
+      role: "assistant",
+      content: [{ type: "text", text: "the answer" }],
+      stopReason: "stop",
+    });
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(result.failure).toBeUndefined();
+    expect(result.responseText).toBe("the answer");
+  });
+
+  it("does NOT flag an empty turn that stopped with toolUse (mid-run, never final)", async () => {
+    const session = sessionEnding({ role: "assistant", content: [], stopReason: "toolUse" });
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(result.failure).toBeUndefined();
+    expect(result.responseText).toBe(""); // a tool call, not a terminal answer
   });
 
   it("resumeAgent applies the same rule", async () => {
@@ -2682,8 +2727,193 @@ describe("agent-runner abort signal forwarding", () => {
 //
 // Exported for this (the file already exports normalizeMaxTurns/setGraceTurns
 // purely for test/agent-runner-settings.test.ts).
-describe("resolveDefaultModel", () => {
-  const parent = { provider: "anthropic", id: "parent-model" } as any;
+describe("strict agent runner evidence", () => {
+  function strictObserver() {
+    return {
+      expectedModel: "provider/exact-model",
+      expectedEffort: "high" as const,
+      onObserved: vi.fn(),
+      onEvidence: vi.fn(),
+      onFailure: vi.fn(),
+    };
+  }
+
+  function strictSession() {
+    const created = createSession("STRICT");
+    const session = created.session as typeof created.session & {
+      model: { provider: string; id: string };
+      thinkingLevel: "high" | "low";
+    };
+    session.model = { provider: "provider", id: "exact-model" };
+    session.thinkingLevel = "high";
+    createAgentSession.mockResolvedValue({ session });
+    return { ...created, session };
+  }
+
+  it("enforces final preflight and counts assistant/output/tool starts", async () => {
+    const { session, listeners } = strictSession();
+    const observer = strictObserver();
+    session.prompt.mockImplementation(async (_text: string, options: { preflightResult?: (success: boolean) => void }) => {
+      options.preflightResult?.(true);
+      for (const listener of listeners) {
+        listener({ type: "agent_start" });
+        listener({ type: "message_start", message: { role: "assistant" } });
+        listener({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: "STRICT" },
+        });
+        listener({ type: "tool_execution_start", toolName: "read" });
+        listener({ type: "tool_execution_end", toolName: "read" });
+      }
+      session.messages.push({ role: "assistant", content: [{ type: "text", text: "STRICT" }] });
+    });
+
+    await runAgent(ctx, "Explore", "go", { pi, strictAttempt: observer });
+
+    expect(session.prompt).toHaveBeenCalledWith("go", {
+      expandPromptTemplates: false,
+      preflightResult: expect.any(Function),
+    });
+    expect(observer.onObserved).toHaveBeenCalledWith({
+      model: "provider/exact-model",
+      effort: "high",
+    });
+    expect(observer.onFailure).not.toHaveBeenCalled();
+    expect(observer.onEvidence).toHaveBeenLastCalledWith({
+      executionStarted: true,
+      assistantMessageStartedCount: 1,
+      assistantOutputEventCount: 1,
+      toolCallStartedCount: 1,
+    });
+  });
+
+  it("fails closed when preflight is accepted but the agent loop never starts", async () => {
+    const { session } = strictSession();
+    const observer = strictObserver();
+    session.prompt.mockImplementation(async (_text: string, options: { preflightResult?: (success: boolean) => void }) => {
+      options.preflightResult?.(true);
+    });
+
+    await expect(runAgent(ctx, "Explore", "go", { pi, strictAttempt: observer }))
+      .rejects.toThrow(/without entering the child agent loop/);
+    expect(observer.onFailure).toHaveBeenCalledWith(
+      "RUNTIME_FAILED",
+      expect.stringContaining("without entering the child agent loop"),
+    );
+  });
+
+  it("refuses a canonical model mismatch before execution", async () => {
+    const { session } = strictSession();
+    const observer = strictObserver();
+    session.model = { provider: "provider", id: "substitute" };
+    session.prompt.mockImplementation(async (_text: string, options: { preflightResult?: (success: boolean) => void }) => {
+      options.preflightResult?.(true);
+    });
+
+    await expect(runAgent(ctx, "Explore", "go", { pi, strictAttempt: observer }))
+      .rejects.toThrow(/selected "provider\/substitute"/);
+    expect(observer.onFailure).toHaveBeenCalledWith(
+      "CANONICAL_MODEL_MISMATCH",
+      expect.stringContaining("provider/substitute"),
+    );
+    expect(observer.onEvidence).not.toHaveBeenCalledWith(
+      expect.objectContaining({ executionStarted: true }),
+    );
+  });
+
+  it("refuses an effective effort mismatch before execution", async () => {
+    const { session } = strictSession();
+    const observer = strictObserver();
+    session.thinkingLevel = "low";
+    session.prompt.mockImplementation(async (_text: string, options: { preflightResult?: (success: boolean) => void }) => {
+      options.preflightResult?.(true);
+    });
+
+    await expect(runAgent(ctx, "Explore", "go", { pi, strictAttempt: observer }))
+      .rejects.toThrow(/applied effort "low"/);
+    expect(observer.onFailure).toHaveBeenCalledWith(
+      "EFFECTIVE_EFFORT_MISMATCH",
+      expect.stringContaining("instead of \"high\""),
+    );
+  });
+
+  it("classifies prompt preflight rejection with explicit zero evidence", async () => {
+    const { session } = strictSession();
+    const observer = strictObserver();
+    session.prompt.mockImplementation(async (_text: string, options: { preflightResult?: (success: boolean) => void }) => {
+      options.preflightResult?.(false);
+      throw new Error("preflight rejected");
+    });
+
+    await expect(runAgent(ctx, "Explore", "go", { pi, strictAttempt: observer }))
+      .rejects.toThrow("preflight rejected");
+    expect(observer.onFailure).toHaveBeenCalledWith("PREFLIGHT_FAILED", "preflight rejected");
+  });
+
+  it("classifies local Pi authentication rejection as AUTH_UNAVAILABLE", async () => {
+    const { session } = strictSession();
+    const observer = strictObserver();
+    session.prompt.mockImplementation(async (_text: string, options: { preflightResult?: (success: boolean) => void }) => {
+      options.preflightResult?.(false);
+      throw new Error('Authentication failed for "provider".');
+    });
+
+    await expect(runAgent(ctx, "Explore", "go", { pi, strictAttempt: observer }))
+      .rejects.toThrow("Authentication failed");
+    expect(observer.onFailure).toHaveBeenCalledWith(
+      "AUTH_UNAVAILABLE",
+      expect.stringContaining("Authentication failed"),
+    );
+  });
+
+  it("classifies an unrecovered final tool error as TOOL_FAILED", async () => {
+    const { session, listeners } = strictSession();
+    const observer = strictObserver();
+    session.prompt.mockImplementation(async (_text: string, options: { preflightResult?: (success: boolean) => void }) => {
+      options.preflightResult?.(true);
+      for (const listener of listeners) {
+        listener({ type: "agent_start" });
+        listener({ type: "message_start", message: { role: "assistant" } });
+        listener({ type: "tool_execution_start", toolName: "bash" });
+        listener({ type: "tool_execution_end", toolName: "bash", isError: true });
+      }
+      session.messages.push({ role: "assistant", content: [], stopReason: "toolUse" });
+    });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi, strictAttempt: observer });
+
+    expect(result.failure).toContain('Tool "bash" failed');
+    expect(observer.onFailure).toHaveBeenCalledWith(
+      "TOOL_FAILED",
+      expect.stringContaining('Tool "bash" failed'),
+    );
+  });
+
+  it("classifies a throw after final preflight as a terminal runtime failure", async () => {
+    const { session } = strictSession();
+    const observer = strictObserver();
+    session.prompt.mockImplementation(async (_text: string, options: { preflightResult?: (success: boolean) => void }) => {
+      options.preflightResult?.(true);
+      throw new Error("after handoff");
+    });
+
+    await expect(runAgent(ctx, "Explore", "go", { pi, strictAttempt: observer }))
+      .rejects.toThrow("after handoff");
+    expect(observer.onFailure).toHaveBeenCalledWith("RUNTIME_FAILED", "after handoff");
+    expect(observer.onEvidence).toHaveBeenCalledWith(expect.objectContaining({ executionStarted: true }));
+  });
+
+  it("preserves the ordinary prompt call shape", async () => {
+    const { session } = createSession("ORDINARY");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(session.prompt).toHaveBeenCalledWith("go");
+  });
+});
+
+describe("resolveDefaultModel", () => {  const parent = { provider: "anthropic", id: "parent-model" } as any;
   const haiku = { provider: "anthropic", id: "claude-haiku-4-5" } as any;
 
   /** Registry whose `find` always succeeds; `getAvailable` is what varies. */

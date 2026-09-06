@@ -112,6 +112,8 @@ export interface RunPrintModeOptions {
   steps?: FauxResponseStep[];
   /** Faux mode: how many model calls to pad the queue for. Default 16. */
   maxModelCalls?: number;
+  /** Faux mode: expose reasoning levels so strict effort enforcement can be exercised. */
+  fauxReasoning?: boolean;
   /**
    * Honor the subagent hold condition — block the parent agent loop until
    * background subagents finish (the pi-chonky-step monkey-patch). Default true.
@@ -309,7 +311,14 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     if (!options.steps && !options.respond) {
       throw new Error("runPrintMode (faux mode): provide `respond` or `steps`");
     }
-    faux = registerFauxProvider({ provider: "faux", models: [{ id: "faux-1", contextWindow: 200_000 }] });
+    faux = registerFauxProvider({
+      provider: "faux",
+      models: [{
+        id: "faux-1",
+        contextWindow: 200_000,
+        reasoning: options.fauxReasoning ?? false,
+      }],
+    });
     model = faux.getModel();
     // Structural faux registry + runtime (see faux-model-backend.ts): the parent
     // session uses `model` directly; subagents inherit it via ctx.model since

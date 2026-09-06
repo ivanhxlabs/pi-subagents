@@ -52,6 +52,11 @@
  * `lineOffset: -1` so reported line numbers match the file the author wrote. Any
  * newline in here shifts every stack frame in every workflow script.
  */
+import {
+  STRICT_AGENT_CONTRACT_VERSION,
+  STRICT_EFFORT_LEVELS,
+} from "../strict-agent.js";
+
 const DETERMINISM_PRELUDE =
   "const Date = (function () {" +
   " const RealDate = globalThis.Date;" +
@@ -74,6 +79,8 @@ const vm = require("node:vm");
 const port = parentPort;
 const ITEM_CAP = workerData.itemCap;
 const PRELUDE = ${JSON.stringify(DETERMINISM_PRELUDE)};
+const STRICT_CONTRACT_VERSION = ${STRICT_AGENT_CONTRACT_VERSION};
+const STRICT_EFFORT_LEVELS = ${JSON.stringify(STRICT_EFFORT_LEVELS)};
 
 /* ------------------------------------------------------------------ *
  * RPC to the host
@@ -336,6 +343,60 @@ const AGENT_OPTIONS = [
 /** Claude Code options this runtime does not have, and why. */
 const UNSUPPORTED_AGENT_OPTIONS = {};
 
+/** Every option the versioned strict route primitive accepts. */
+const STRICT_AGENT_OPTIONS = [
+  "contractVersion",
+  "agentType",
+  "model",
+  "fallbackModels",
+  "effort",
+  "schema",
+  "isolation",
+];
+
+function strictContractError(code, message) {
+  const error = new Error(message);
+  error.name = "StrictAgentContractError";
+  error.code = code;
+  // A contract violation must not be folded to null by parallel()/pipeline().
+  error.workflowFatal = true;
+  return error;
+}
+
+function requireStrictText(value, field) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw strictContractError("INVALID_ARGUMENT", "strictAgent() " + field + " must be a non-empty string.");
+  }
+  return value;
+}
+
+function requireStrictAgentType(value) {
+  const type = requireStrictText(value, "opts.agentType");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(type)) {
+    throw strictContractError(
+      "UNKNOWN_AGENT_TYPE",
+      "strictAgent() opts.agentType must be an exact safe agent type name."
+    );
+  }
+  return type;
+}
+
+function requireExactModelId(value, field) {
+  const id = requireStrictText(value, field);
+  const slash = id.indexOf("/");
+  if (
+    slash <= 0 ||
+    slash === id.length - 1 ||
+    !/^[A-Za-z0-9][A-Za-z0-9._:@+\\/-]*$/.test(id)
+  ) {
+    throw strictContractError(
+      "INVALID_MODEL_ID",
+      "strictAgent() " + field + " must be an exact, case-sensitive provider/model id."
+    );
+  }
+  return id;
+}
+
 /* ------------------------------------------------------------------ *
  * Script globals
  * ------------------------------------------------------------------ */
@@ -370,6 +431,9 @@ function makeScope(name, depth) {
   };
   scope.agent = function (prompt, opts) {
     return agentIn(scope, prompt, opts);
+  };
+  scope.strictAgent = function (prompt, opts) {
+    return strictAgentIn(scope, prompt, opts);
   };
   scope.phase = function (title) {
     return phaseIn(scope, title);
@@ -437,6 +501,93 @@ function makeConsole(scope) {
     emit({ type: "workflow_log", message: logPrefix(scope) + parts.join(" ") });
   };
   return { log: write, info: write, warn: write, error: write, debug: write };
+}
+
+async function strictAgentIn(scope, prompt, opts) {
+  const text = requireStrictText(prompt, "prompt");
+  if (!opts || typeof opts !== "object" || Array.isArray(opts)) {
+    throw strictContractError("INVALID_ARGUMENT", "strictAgent(prompt, opts) requires an options object.");
+  }
+
+  for (const key of Object.keys(opts)) {
+    if (STRICT_AGENT_OPTIONS.indexOf(key) === -1) {
+      throw strictContractError(
+        "INVALID_ARGUMENT",
+        "strictAgent() opts." + key + " is not recognised. Supported: " + STRICT_AGENT_OPTIONS.join(", ") + "."
+      );
+    }
+  }
+
+  if (opts.contractVersion !== STRICT_CONTRACT_VERSION) {
+    throw strictContractError(
+      "UNSUPPORTED_CONTRACT_VERSION",
+      "strictAgent() requires contractVersion: " + STRICT_CONTRACT_VERSION + "."
+    );
+  }
+
+  const agentType = requireStrictAgentType(opts.agentType);
+  const model = requireExactModelId(opts.model, "opts.model");
+  if (!Array.isArray(opts.fallbackModels)) {
+    throw strictContractError("INVALID_ARGUMENT", "strictAgent() opts.fallbackModels must be an array.");
+  }
+  const fallbackModels = [];
+  for (let i = 0; i < opts.fallbackModels.length; i++) {
+    fallbackModels.push(requireExactModelId(opts.fallbackModels[i], "opts.fallbackModels[" + i + "]"));
+  }
+  const candidates = [model].concat(fallbackModels);
+  if (new Set(candidates).size !== candidates.length) {
+    throw strictContractError("INVALID_MODEL_ID", "strictAgent() route candidates must not contain duplicates.");
+  }
+
+  const effort = requireStrictText(opts.effort, "opts.effort");
+  if (STRICT_EFFORT_LEVELS.indexOf(effort) === -1) {
+    throw strictContractError(
+      "UNSUPPORTED_EFFORT",
+      "strictAgent() opts.effort must be one of: " + STRICT_EFFORT_LEVELS.join(", ") + "."
+    );
+  }
+
+  const isolation = opts.isolation;
+  if (isolation !== undefined && isolation !== "worktree") {
+    throw strictContractError("INVALID_ISOLATION", 'strictAgent() opts.isolation must be "worktree".');
+  }
+
+  const schema = opts.schema;
+  if (schema !== undefined) {
+    if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
+      throw strictContractError("INVALID_SCHEMA", "strictAgent() opts.schema must be a JSON Schema object.");
+    }
+    try {
+      checkBoundary(schema, "strictAgent() opts.schema");
+    } catch (error) {
+      throw strictContractError("INVALID_SCHEMA", describe(error));
+    }
+  }
+
+  const result = await callHost("strictAgent", {
+    contractVersion: STRICT_CONTRACT_VERSION,
+    prompt: text,
+    agentType: agentType,
+    model: model,
+    fallbackModels: fallbackModels,
+    effort: effort,
+    schema: schema,
+    isolation: isolation,
+    phaseIndex: scope.ambientPhaseIndex,
+    phaseTitle: scope.ambientPhaseTitle,
+  });
+
+  if (result && result.contractError) {
+    throw strictContractError(result.contractError.code, result.contractError.message);
+  }
+
+  // Move the complete receipt into the workflow realm. This preserves normal
+  // \`instanceof Object\` / \`instanceof Array\` behavior for scripts.
+  try {
+    return realmParse(JSON.stringify(result));
+  } catch (error) {
+    throw strictContractError("INVALID_ARGUMENT", "strictAgent(): the host returned an invalid route receipt.");
+  }
 }
 
 async function agentIn(scope, prompt, opts) {
@@ -681,7 +832,7 @@ async function workflowIn(scope, nameOrRef, args) {
       // \`meta\` is deliberately not a parameter: the body still opens with its
       // own \`const meta = { ... }\` (extractMeta strips only the \`export\`), so a
       // parameter of that name would collide with it.
-      "(async (agent, phase, log, workflow, console, args) => {" + PRELUDE + "\\n" + loaded.body + "\\n})",
+      "(async (agent, strictAgent, phase, log, workflow, console, args) => {" + PRELUDE + "\\n" + loaded.body + "\\n})",
       { filename: "workflow:" + loaded.name + ".js", lineOffset: -1 }
     );
     run = compiled.runInContext(realmContext);
@@ -689,7 +840,7 @@ async function workflowIn(scope, nameOrRef, args) {
     throw new Error('workflow("' + label + '"): ' + describe(error));
   }
 
-  const value = await run(child.agent, child.phase, child.log, child.workflow, child.console, args);
+  const value = await run(child.agent, child.strictAgent, child.phase, child.log, child.workflow, child.console, args);
   checkBoundary(value, 'the result of workflow("' + label + '")');
   return value;
 }
@@ -729,6 +880,7 @@ async function main() {
   rootScope = makeScope(undefined, 0);
   const sandbox = {
     agent: rootScope.agent,
+    strictAgent: rootScope.strictAgent,
     parallel: parallel,
     pipeline: pipeline,
     phase: rootScope.phase,

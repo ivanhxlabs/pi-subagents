@@ -59,9 +59,12 @@ export function setFallbackSubagent(v: string | undefined): void { fallbackSubag
  * Pure — callers that must not disturb the process-wide registry (nested
  * delegation resolving agents from its own config root) build their own map.
  */
-export function buildAgentRegistry(userAgents: Map<string, AgentConfig>): Map<string, AgentConfig> {
+export function buildAgentRegistry(
+  userAgents: Map<string, AgentConfig>,
+  options: { disableDefaults?: boolean } = {},
+): Map<string, AgentConfig> {
   const registry = new Map<string, AgentConfig>();
-  if (!disableDefaults) {
+  if (!(options.disableDefaults ?? disableDefaults)) {
     for (const [name, config] of DEFAULT_AGENTS) registry.set(name, config);
   }
   for (const [name, config] of userAgents) registry.set(name, config);
@@ -78,6 +81,17 @@ export function registerAgents(userAgents: Map<string, AgentConfig>): void {
   for (const [name, config] of buildAgentRegistry(userAgents)) {
     agents.set(name, config);
   }
+}
+
+/** Resolve an exact, case-sensitive enabled type without fallback. */
+export function resolveExactEnabledTypeIn(
+  registry: Map<string, AgentConfig>,
+  requested: string,
+): string | undefined {
+  if (requested.trim() !== requested || requested === "") return undefined;
+  return registry.get(requested)?.enabled !== false && registry.has(requested)
+    ? requested
+    : undefined;
 }
 
 /** Case-insensitive key resolution within a registry. */

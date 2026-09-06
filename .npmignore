@@ -13,6 +13,7 @@ media/
 # Internal contributor/agent instructions — not for distribution
 AGENTS.md
 CLAUDE.md
+scripts/
 
 # Build artifacts
 *.log

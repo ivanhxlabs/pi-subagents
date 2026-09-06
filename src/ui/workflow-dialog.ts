@@ -593,7 +593,9 @@ export function agentActions(
   entry: WorkflowAgentEntry | undefined,
   workflowActive: boolean,
 ): { skip: boolean; retry: boolean } {
-  if (entry === undefined || !workflowActive) return { skip: false, retry: false };
+  if (entry === undefined || !workflowActive || entry.strictRoute) {
+    return { skip: false, retry: false };
+  }
   const state = displayState(entry, workflowActive);
   return { skip: state === "queued" || state === "running", retry: state === "running" };
 }

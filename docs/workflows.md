@@ -250,6 +250,67 @@ Any other key is rejected **by name** at the call. Note that this checks option 
 
 Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.
 
+### Strict route launches
+
+`strictAgent()` is a separate, opt-in workflow global for callers that must prove an exact model route before consuming a child result. It does not read routes from agent files or settings, and it does not change ordinary `agent()`.
+
+```js
+const route = await strictAgent("Review the change.", {
+  contractVersion: 1,
+  agentType: "hx-reviewer-a",
+  model: "openai-codex/gpt-5.6-codex",
+  fallbackModels: ["openai-codex/gpt-5.5-codex"],
+  effort: "high",
+  schema: VERDICT,       // optional
+  isolation: "worktree", // optional
+})
+```
+
+The primary and fallbacks are distinct, exact, case-sensitive `provider/modelId` strings. Model IDs may contain additional slashes. The runtime tries them serially. Every admitted candidate is a fresh child session; isolated attempts receive separate managed worktrees. A candidate advances only after one of these typed pre-execution failures:
+
+- `MODEL_UNAVAILABLE`
+- `AUTH_UNAVAILABLE`
+- `CANONICAL_MODEL_MISMATCH`
+- `EFFECTIVE_EFFORT_MISMATCH`
+
+Advancement also requires explicit runtime evidence that `executionStarted` is false and all three counters are zero: `assistantMessageStartedCount`, `assistantOutputEventCount`, and `toolCallStartedCount`. Cancellation, any other preflight failure, and every failure after the execution boundary are terminal.
+
+Success and failure return a route receipt, never `null`:
+
+```js
+{
+  contractVersion: 1,
+  launchId,
+  agentType,
+  requestedEffort,
+  outcome: "succeeded" | "failed",
+  attempts: [{
+    attemptId,
+    candidateIndex,
+    requestedModel,
+    observedModel,
+    observedEffort,
+    outcome: "selected" | "pre-execution-failure" | "post-execution-failure",
+    failure: { code, message }, // failures only
+    evidence: {
+      executionStarted,
+      assistantMessageStartedCount,
+      assistantOutputEventCount,
+      toolCallStartedCount,
+    },
+  }],
+  selected: { candidateIndex, requestedModel, observedModel, requestedEffort, observedEffort }, // success only
+  result,  // success only; schema-validated object when schema was supplied
+  failure, // failed route only; ROUTE_EXHAUSTED after all admissible candidates fail
+}
+```
+
+Invalid version, arguments, role, model syntax, effort, schema, isolation, replay, or Pi capability throws `StrictAgentContractError` with a stable `code` before a route launch exists. Strict attempt diagnostics are bounded and credential-redacted.
+
+The runtime owns exact resolution, final preflight, fallback mechanics, fresh attempts, observations, counters, reason codes, and attempt history. The caller still owns route-table loading/versioning, model-family classification, pair-family gates, parallel lanes, stable lane ordering, post-validation, and all-or-nothing result policy.
+
+Strict attempts append machine-readable progress and journal records without child results. A completed strict call is evidence, not a cache: `resumeFromRunId` stops at it with `STRICT_REPLAY_UNSUPPORTED`. Re-run without journal replay to obtain a fresh route observation. Workflow pause prevents the next fallback from starting; per-agent skip/retry controls are intentionally unavailable on strict rows because route advancement and attempt history are runtime-owned. Stop the workflow to cancel a strict attempt.
+
 ### `pipeline()` and `parallel()`
 
 ```js
@@ -379,6 +440,9 @@ An `agentType` that names no known agent falls back to `general-purpose` **silen
 **`agent()` returned `null`.**
 The agent failed terminally, or you skipped it with `s` in the inspector. These are indistinguishable to the script. With `schema`, it also covers a child that never produced a payload matching the schema.
 
+**`STRICT_REPLAY_UNSUPPORTED`.**
+The resumed journal already contains a completed `strictAgent()` call. Strict receipts are historical evidence and cannot substitute for a fresh exact-route launch. Re-run without `resumeFromRunId`.
+
 **A `schema` call came back as `null` even though the agent clearly answered.**
 `schema` is pressure, not a guarantee. The child gets a `StructuredOutput` tool, `constrainedSampling` set to `strict: "prefer"`, and a validation-and-retry round trip — three soft pressures, where Claude Code has one hard one (it can force the tool call; this cannot, because `toolChoice` is not plumbed through pi's `AgentSession`). Keep schemas small and flat, and `.filter(Boolean)` after every schema stage.
 
@@ -420,7 +484,7 @@ Different:
 - **`schema` is pressured, not forced** — see the troubleshooting entry above.
 - If both extensions are loaded, this one **stands down** rather than offering the model two orchestrators.
 
-Additions on this side: `gate`, `resume`, `effort`, journal-backed `resumeFromRunId`, and the un-awaited-`agent()` check. All are optional, which is what keeps a Claude Code script portable.
+Additions on this side: `gate`, `resume`, `effort`, `strictAgent()`, journal-backed `resumeFromRunId`, and the un-awaited-`agent()` check. All are additive, which is what keeps a Claude Code script portable.
 
 ## Examples
 

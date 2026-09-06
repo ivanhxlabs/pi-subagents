@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { describeModel, type ModelRegistry, resolveModel } from "../src/model-resolver.js";
+import {
+  describeModel,
+  type ModelRegistry,
+  resolveExactAvailableModel,
+  resolveModel,
+} from "../src/model-resolver.js";
 
 // Mock model entries matching typical pi model registry shape
 const MODELS = [
@@ -255,6 +260,56 @@ describe("resolveModel", () => {
       expect(typeof result).toBe("string");
       expect(result).toContain("Model not found");
     });
+  });
+});
+
+describe("resolveExactAvailableModel", () => {
+  it("accepts only the exact case-sensitive registered and available id", () => {
+    expect(resolveExactAvailableModel("anthropic/claude-opus-4-6", makeRegistry()))
+      .toMatchObject({ ok: true, canonicalId: "anthropic/claude-opus-4-6", model: MODELS[0] });
+  });
+
+  it("preserves slashes inside the model id", () => {
+    const model = { id: "accounts/acme/models/strict", name: "Strict", provider: "gateway" };
+    expect(resolveExactAvailableModel("gateway/accounts/acme/models/strict", makeRegistry([model])))
+      .toMatchObject({ ok: true, canonicalId: "gateway/accounts/acme/models/strict" });
+  });
+
+  it.each([
+    "claude-opus-4-6",
+    "/claude-opus-4-6",
+    "anthropic/",
+    " anthropic/claude-opus-4-6",
+    "anthropic/claude opus",
+    "anthropic/claude\u001b[31m",
+    "anthropic/claude\u202emodel",
+    "anthropic/model=secret",
+  ])("rejects non-exact qualified syntax: %s", input => {
+    expect(resolveExactAvailableModel(input, makeRegistry())).toMatchObject({
+      ok: false,
+      code: "INVALID_MODEL_ID",
+    });
+  });
+
+  it("does not normalize case, punctuation, dates, or providers", () => {
+    for (const input of [
+      "Anthropic/claude-opus-4-6",
+      "anthropic/claude.opus.4.6",
+      "anthropic/claude-opus-4-6-20260101",
+      "openrouter/claude-opus-4-6",
+    ]) {
+      expect(resolveExactAvailableModel(input, makeRegistry())).toMatchObject({
+        ok: false,
+        code: "MODEL_UNAVAILABLE",
+      });
+    }
+  });
+
+  it("distinguishes an exact registered model without configured auth", () => {
+    expect(resolveExactAvailableModel(
+      "anthropic/claude-sonnet-4-6",
+      makeRegistry(MODELS, [MODELS[0]]),
+    )).toMatchObject({ ok: false, code: "AUTH_UNAVAILABLE" });
   });
 });
 

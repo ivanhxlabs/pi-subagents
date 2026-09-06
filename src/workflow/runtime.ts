@@ -13,9 +13,30 @@
  * to the real manager lives at the call site.
  */
 
+import { randomUUID } from "node:crypto";
 import { cpus } from "node:os";
 import { Worker } from "node:worker_threads";
-import { type JournalKeyInput, journalKey, type WorkflowJournalEntry } from "./journal.js";
+import { isExactQualifiedModelId } from "../model-resolver.js";
+import {
+  canAdvanceStrictRoute,
+  emptyStrictExecutionEvidence,
+  STRICT_AGENT_CONTRACT_VERSION,
+  STRICT_EFFORT_LEVELS,
+  type StrictAttemptReceipt,
+  type StrictContractFailure,
+  type StrictContractFailureCode,
+  type StrictEffort,
+  type StrictExecutionEvidence,
+  type StrictFailure,
+  type StrictRouteResult,
+} from "../strict-agent.js";
+import { sanitizeStrictDiagnostic } from "../strict-diagnostics.js";
+import {
+  type JournalKeyInput,
+  journalKey,
+  strictJournalKey,
+  type WorkflowJournalEntry,
+} from "./journal.js";
 import { type CompiledSchema, compileJsonSchema } from "./json-schema.js";
 import { extractMeta, type WorkflowMeta } from "./meta.js";
 import type { WorkflowAgentEntry, WorkflowEntry } from "./progress.js";
@@ -120,6 +141,54 @@ export interface WorkflowSpawnRequest {
   gate?: string;
 }
 
+export interface WorkflowStrictAgentRequest {
+  contractVersion: typeof STRICT_AGENT_CONTRACT_VERSION;
+  prompt: string;
+  agentType: string;
+  model: string;
+  fallbackModels: string[];
+  effort: StrictEffort;
+  isolation?: "worktree";
+  schema?: CompiledSchema;
+  phaseIndex?: number;
+  phaseTitle?: string;
+}
+
+export type WorkflowStrictValidationResult =
+  | { ok: true; agentType: string; isolation?: "worktree" }
+  | { ok: false; failure: StrictFailure<StrictContractFailureCode> };
+
+export interface WorkflowStrictAttemptRequest {
+  launchId: string;
+  attemptId: string;
+  agentId: string;
+  candidateIndex: number;
+  prompt: string;
+  agentType: string;
+  model: string;
+  effort: StrictEffort;
+  isolation?: "worktree";
+  schema?: CompiledSchema;
+  /** Record/session observations are reported while the attempt is live. */
+  onResolved?(info: {
+    recordId?: string;
+    modelName?: string;
+    modelId?: string;
+    thinking?: string;
+  }): void;
+  /** Monotonic runtime evidence, reported at each execution boundary/event. */
+  onEvidence?(evidence: StrictExecutionEvidence): void;
+}
+
+export interface WorkflowStrictAttemptResult {
+  attempt: StrictAttemptReceipt;
+  /** Child output. Present only when the attempt was selected. */
+  text?: string;
+  tokens?: number;
+  outputTokens?: number;
+  toolCalls?: number;
+}
+
 export interface WorkflowSpawnResult {
   ok: boolean;
   /** The agent's answer. Present when `ok`. */
@@ -183,6 +252,10 @@ export type WorkflowScriptSource =
 
 export interface WorkflowHost {
   spawnAgent(request: WorkflowSpawnRequest): Promise<WorkflowSpawnResult>;
+  /** Validate strict-only capabilities and exact role dispatch before a launch id exists. */
+  validateStrictAgent?(request: WorkflowStrictAgentRequest): WorkflowStrictValidationResult;
+  /** Execute one fresh strict candidate attempt. The runtime owns route advancement. */
+  spawnStrictAttempt?(request: WorkflowStrictAttemptRequest): Promise<WorkflowStrictAttemptResult>;
   /** Called for every in-flight agent when the run aborts. */
   abortAgent(agentId: string): void;
   /**
@@ -428,6 +501,19 @@ class Semaphore {
  * Messages
  * ------------------------------------------------------------------------- */
 
+interface StrictAgentCallPayload {
+  contractVersion: typeof STRICT_AGENT_CONTRACT_VERSION;
+  prompt: string;
+  agentType: string;
+  model: string;
+  fallbackModels: string[];
+  effort: StrictEffort;
+  isolation?: "worktree";
+  phaseIndex?: number;
+  phaseTitle?: string;
+  schema?: unknown;
+}
+
 interface AgentCallPayload {
   prompt: string;
   label?: string;
@@ -447,7 +533,7 @@ interface AgentCallPayload {
 }
 
 type WorkerMessage =
-  | { type: "call"; callId: number; method: string; payload: AgentCallPayload }
+  | { type: "call"; callId: number; method: string; payload: AgentCallPayload | StrictAgentCallPayload | WorkflowScriptRef }
   | { type: "progress"; entries: WorkflowEntry[] }
   | { type: "complete"; resultJson?: string }
   | { type: "error"; message: string; stack?: string };
@@ -462,6 +548,17 @@ const preview = (text: string) =>
 function derivedLabel(prompt: string): string {
   const line = prompt.split("\n", 1)[0].trim();
   return line.length <= 60 ? line || "agent" : `${line.slice(0, 59)}…`;
+}
+
+function strictContractFailure(
+  code: StrictContractFailureCode,
+  message: string,
+): StrictContractFailure {
+  return { contractError: { code, message: sanitizeStrictDiagnostic(message) } };
+}
+
+function strictLaunchId(): string {
+  return `strict_${randomUUID().replaceAll("-", "").slice(0, 16)}`;
 }
 
 /**
@@ -607,6 +704,8 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
    */
   const openLaunches = new Map<number, string>();
   let agentCount = 0;
+  let nextAgentIndex = 0;
+  let reservedAgentSlots = 0;
   let aborted = false;
   let settled = false;
 
@@ -646,6 +745,25 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
     wake?: () => void;
   }
   const liveAgents = new Map<number, LiveAgent>();
+
+  interface LiveStrictAttempt {
+    agentId: string;
+    index: number;
+    key: string;
+    launchId: string;
+    agentType: string;
+    requestedEffort: StrictEffort;
+    attemptId: string;
+    candidateIndex: number;
+    requestedModel: string;
+    evidence: StrictExecutionEvidence;
+    observedModel?: string;
+    observedEffort?: StrictAttemptReceipt["observedEffort"];
+    base: WorkflowAgentEntry;
+    startedAt: number;
+    journaled: boolean;
+  }
+  const liveStrictAttempts = new Map<string, LiveStrictAttempt>();
 
   /**
    * Output tokens this run has spent, mirrored to the script as
@@ -764,6 +882,47 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
 
     function onAbort() {
       aborted = true;
+      // Strict cancellation evidence must survive even though the worker is
+      // terminated immediately. Snapshot every active attempt before finish().
+      for (const live of liveStrictAttempts.values()) {
+        if (live.journaled) continue;
+        const attempt: StrictAttemptReceipt = {
+          attemptId: live.attemptId,
+          candidateIndex: live.candidateIndex,
+          requestedModel: live.requestedModel,
+          outcome: live.evidence.executionStarted
+            ? "post-execution-failure"
+            : "pre-execution-failure",
+          failure: { code: "CANCELLED", message: "Workflow aborted." },
+          evidence: { ...live.evidence },
+          ...(live.observedModel !== undefined ? { observedModel: live.observedModel } : {}),
+          ...(live.observedEffort !== undefined ? { observedEffort: live.observedEffort } : {}),
+        };
+        live.journaled = true;
+        recordJournal?.({
+          index: live.index,
+          key: live.key,
+          ok: false,
+          kind: "strict-attempt",
+          strict: {
+            contractVersion: STRICT_AGENT_CONTRACT_VERSION,
+            launchId: live.launchId,
+            agentType: live.agentType,
+            requestedEffort: live.requestedEffort,
+            attempt,
+          },
+        });
+        const finishedAt = Date.now();
+        emit([{
+          ...live.base,
+          state: "error",
+          lastProgressAt: finishedAt,
+          durationMs: finishedAt - live.startedAt,
+          error: "Workflow aborted.",
+          strictAttempt: attempt,
+          toolCalls: attempt.evidence.toolCallStartedCount,
+        }]);
+      }
       // terminate() is why this runs in a worker at all: it stops a script that
       // is spinning or wedged mid-await, which an in-process vm cannot do.
       finish({ status: "killed", error: "Workflow aborted." });
@@ -837,13 +996,14 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
         compiledSchema = compilation.compiled;
       }
 
-      if (agentCount >= agentCap) {
+      if (agentCount + reservedAgentSlots >= agentCap) {
         // Fatal, so parallel()/pipeline() rethrow instead of folding it into a
         // null. A cap that silently drops work is worse than no cap.
         respond(callId, false, undefined, `Workflow exceeded its cap of ${agentCap} agents.`, true);
         return;
       }
-      const index = agentCount++;
+      const index = nextAgentIndex++;
+      agentCount++;
       // A resumed call is the same child again: it keeps the agent id, so an
       // abort still reaches it, and it keeps its spawn contract, so the row
       // reads the same as the row it continues.
@@ -1129,6 +1289,422 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       }
     }
 
+    async function handleStrictAgent(callId: number, payload: StrictAgentCallPayload): Promise<void> {
+      const validateStrictAgent = host.validateStrictAgent?.bind(host);
+      const spawnStrictAttempt = host.spawnStrictAttempt?.bind(host);
+      if (validateStrictAgent === undefined || spawnStrictAttempt === undefined) {
+        respond(callId, true, strictContractFailure(
+          "INCOMPATIBLE_PI_RUNTIME",
+          "This workflow host does not provide the strict route-launch contract.",
+        ));
+        return;
+      }
+
+      let compiledSchema: CompiledSchema | undefined;
+      if (payload.schema !== undefined) {
+        const compilation = compileJsonSchema(payload.schema);
+        if (!compilation.ok) {
+          respond(callId, true, strictContractFailure("INVALID_SCHEMA", compilation.message));
+          return;
+        }
+        compiledSchema = compilation.compiled;
+      }
+
+      const candidates = [payload.model, ...payload.fallbackModels];
+
+      // Strict evidence can be journaled but never substituted for a fresh
+      // launch. A resumed run stops at the first strict call it reached before.
+      if (prefixIntact) {
+        const prior = journalEntries.find(entry => entry.index === nextAgentIndex);
+        if (prior?.kind === "strict-attempt") {
+          respond(callId, true, strictContractFailure(
+            "STRICT_REPLAY_UNSUPPORTED",
+            "A completed strictAgent() call cannot be replayed from a workflow journal. Re-run without resumeFromRunId.",
+          ));
+          return;
+        }
+        prefixIntact = false;
+      }
+
+      let validation: WorkflowStrictValidationResult;
+      try {
+        validation = validateStrictAgent({
+          contractVersion: payload.contractVersion,
+          prompt: payload.prompt,
+          agentType: payload.agentType,
+          model: payload.model,
+          fallbackModels: payload.fallbackModels,
+          effort: payload.effort,
+          ...(payload.isolation !== undefined ? { isolation: payload.isolation } : {}),
+          ...(compiledSchema !== undefined ? { schema: compiledSchema } : {}),
+          ...(payload.phaseIndex !== undefined ? { phaseIndex: payload.phaseIndex } : {}),
+          ...(payload.phaseTitle !== undefined ? { phaseTitle: payload.phaseTitle } : {}),
+        });
+      } catch (error) {
+        respond(callId, true, strictContractFailure(
+          "INCOMPATIBLE_PI_RUNTIME",
+          error instanceof Error ? error.message : String(error),
+        ));
+        return;
+      }
+      if (!validation.ok) {
+        respond(
+          callId,
+          true,
+          strictContractFailure(validation.failure.code, validation.failure.message),
+        );
+        return;
+      }
+
+      // Reserve both capacity and stable indices synchronously, before the
+      // first await. Concurrent calls cannot consume the route's fallback
+      // budget or reorder its journal positions while it waits for a permit.
+      if (agentCount + reservedAgentSlots + candidates.length > agentCap) {
+        respond(
+          callId,
+          false,
+          undefined,
+          `Workflow strict route could require ${candidates.length} attempts, exceeding its cap of ${agentCap} agents.`,
+          true,
+        );
+        return;
+      }
+      const strictIndexStart = nextAgentIndex;
+      nextAgentIndex += candidates.length;
+      reservedAgentSlots += candidates.length;
+      let remainingReservation = candidates.length;
+
+      const launchId = strictLaunchId();
+      const attempts: StrictAttemptReceipt[] = [];
+      const label = derivedLabel(payload.prompt);
+      const routeKey = strictJournalKey({
+        contractVersion: STRICT_AGENT_CONTRACT_VERSION,
+        prompt: payload.prompt,
+        agentType: validation.agentType,
+        model: payload.model,
+        fallbackModels: payload.fallbackModels,
+        effort: payload.effort,
+        ...(validation.isolation !== undefined ? { isolation: validation.isolation } : {}),
+        ...(payload.schema !== undefined ? { schema: JSON.stringify(payload.schema) } : {}),
+      });
+      openLaunches.set(callId, label);
+
+      const strictPauseState: LiveAgent = { agentId: "", started: false };
+      let acquired = false;
+      try {
+        for (;;) {
+          await pauseGate(strictPauseState);
+          if (aborted || settled) {
+            respond(callId, false, undefined, "Workflow aborted.", true);
+            return;
+          }
+          await semaphore.acquire();
+          acquired = true;
+          // A pause may land while this route waits behind the semaphore. Give
+          // the permit back and join the pause gate before starting a child.
+          if (!isPaused()) break;
+          semaphore.release();
+          acquired = false;
+        }
+
+        for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
+          if (candidateIndex > 0) {
+            await pauseGate(strictPauseState);
+            if (aborted || settled) return;
+          }
+          const requestedModel = candidates[candidateIndex];
+          const index = strictIndexStart + candidateIndex;
+          remainingReservation--;
+          reservedAgentSlots--;
+          agentCount++;
+          const attemptId = `${launchId}:${candidateIndex}`;
+          const agentId = `wf-strict-${launchId}-${candidateIndex}`;
+          const queuedAt = Date.now();
+          const startedAt = Date.now();
+          let evidence = emptyStrictExecutionEvidence();
+          const base: WorkflowAgentEntry = {
+            type: "workflow_agent",
+            index,
+            label: candidates.length === 1 ? label : `${label} [${candidateIndex + 1}/${candidates.length}]`,
+            state: "start",
+            agentId,
+            agentType: validation.agentType,
+            model: requestedModel,
+            requestedThinking: payload.effort,
+            strictRoute: true,
+            strictLaunchId: launchId,
+            promptPreview: preview(payload.prompt),
+            queuedAt,
+            startedAt,
+            ...(validation.isolation !== undefined ? { isolation: validation.isolation } : {}),
+            ...(payload.phaseIndex !== undefined ? { phaseIndex: payload.phaseIndex } : {}),
+            ...(payload.phaseTitle !== undefined ? { phaseTitle: payload.phaseTitle } : {}),
+          };
+          emit([base]);
+          inflight.add(agentId);
+          const liveStrict: LiveStrictAttempt = {
+            agentId,
+            index,
+            key: routeKey,
+            launchId,
+            agentType: validation.agentType,
+            requestedEffort: payload.effort,
+            attemptId,
+            candidateIndex,
+            requestedModel,
+            evidence,
+            base,
+            startedAt,
+            journaled: false,
+          };
+          liveStrictAttempts.set(agentId, liveStrict);
+
+          const onResolved = (info: {
+            recordId?: string;
+            modelName?: string;
+            modelId?: string;
+            thinking?: string;
+          }) => {
+            if (info.recordId !== undefined) base.recordId = info.recordId;
+            if (info.modelName !== undefined) base.model = info.modelName;
+            if (info.modelId !== undefined) {
+              base.modelId = info.modelId;
+              liveStrict.observedModel = info.modelId;
+            }
+            if (info.thinking !== undefined) {
+              base.thinking = info.thinking;
+              liveStrict.observedEffort = info.thinking as StrictAttemptReceipt["observedEffort"];
+            }
+            if (!inflight.has(agentId)) return;
+            emit([{ ...base, lastProgressAt: Date.now() }]);
+          };
+          const onEvidence = (next: StrictExecutionEvidence) => {
+            evidence = { ...next };
+            liveStrict.evidence = evidence;
+          };
+
+          let hostResult: WorkflowStrictAttemptResult;
+          try {
+            hostResult = await spawnStrictAttempt({
+              launchId,
+              attemptId,
+              agentId,
+              candidateIndex,
+              prompt: payload.prompt,
+              agentType: validation.agentType,
+              model: requestedModel,
+              effort: payload.effort,
+              ...(validation.isolation !== undefined ? { isolation: validation.isolation } : {}),
+              ...(compiledSchema !== undefined ? { schema: compiledSchema } : {}),
+              onResolved,
+              onEvidence,
+            });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            hostResult = {
+              attempt: {
+                attemptId,
+                candidateIndex,
+                requestedModel,
+                outcome: evidence.executionStarted ? "post-execution-failure" : "pre-execution-failure",
+                failure: {
+                  code: evidence.executionStarted ? "RUNTIME_FAILED" : "PREFLIGHT_FAILED",
+                  message,
+                },
+                evidence,
+              },
+            };
+          } finally {
+            inflight.delete(agentId);
+            liveStrictAttempts.delete(agentId);
+          }
+
+          // onAbort snapshots and journals a live strict attempt before the
+          // worker is terminated. Its eventual host settlement must not write
+          // a second, contradictory receipt.
+          if (liveStrict.journaled || settled) return;
+
+          const hostAttempt = hostResult.attempt;
+          let attempt: StrictAttemptReceipt = {
+            attemptId,
+            candidateIndex,
+            requestedModel,
+            outcome: hostAttempt.outcome,
+            evidence: hostAttempt.evidence,
+            ...(hostAttempt.observedModel !== undefined &&
+              isExactQualifiedModelId(hostAttempt.observedModel)
+              ? { observedModel: hostAttempt.observedModel }
+              : {}),
+            ...(hostAttempt.observedEffort === "off" ||
+              (hostAttempt.observedEffort !== undefined &&
+                STRICT_EFFORT_LEVELS.includes(hostAttempt.observedEffort))
+              ? { observedEffort: hostAttempt.observedEffort }
+              : {}),
+            ...(hostAttempt.failure !== undefined
+              ? {
+                  failure: {
+                    code: hostAttempt.failure.code,
+                    message: sanitizeStrictDiagnostic(hostAttempt.failure.message),
+                  },
+                }
+              : {}),
+          };
+
+          // Runtime-side defence in depth: a host cannot select a substituted
+          // model or a clamped effort even if its final-preflight check drifted.
+          if (attempt.outcome === "selected" && attempt.observedModel !== requestedModel) {
+            attempt = {
+              ...attempt,
+              outcome: attempt.evidence.executionStarted
+                ? "post-execution-failure"
+                : "pre-execution-failure",
+              failure: {
+                code: "CANONICAL_MODEL_MISMATCH",
+                message: sanitizeStrictDiagnostic(
+                  `Strict attempt selected "${attempt.observedModel ?? "(unknown)"}" instead of "${requestedModel}".`,
+                ),
+              },
+            };
+          }
+          if (attempt.outcome === "selected" && attempt.observedEffort !== payload.effort) {
+            attempt = {
+              ...attempt,
+              outcome: attempt.evidence.executionStarted
+                ? "post-execution-failure"
+                : "pre-execution-failure",
+              failure: {
+                code: "EFFECTIVE_EFFORT_MISMATCH",
+                message: sanitizeStrictDiagnostic(
+                  `Strict attempt used effort "${attempt.observedEffort ?? "(unknown)"}" instead of "${payload.effort}".`,
+                ),
+              },
+            };
+          }
+          if (attempt.outcome === "selected" && !attempt.evidence.executionStarted) {
+            attempt = {
+              ...attempt,
+              outcome: "pre-execution-failure",
+              failure: {
+                code: "PREFLIGHT_FAILED",
+                message: "Strict attempt reported success without crossing the execution boundary.",
+              },
+            };
+          }
+
+          if (attempt.outcome === "selected" && compiledSchema !== undefined) {
+            const checked = applySchema({ ok: true, text: hostResult.text ?? "" }, compiledSchema);
+            if (!checked.ok) {
+              attempt = {
+                ...attempt,
+                outcome: "post-execution-failure",
+                failure: {
+                  code: "SCHEMA_REJECTED",
+                  message: checked.error ?? "Structured output was rejected.",
+                },
+              };
+            }
+          }
+
+          attempts.push(attempt);
+          spentOutputTokens += hostResult.outputTokens ?? 0;
+          const finishedAt = Date.now();
+          emit([{
+            ...base,
+            state: attempt.outcome === "selected" ? "done" : "error",
+            lastProgressAt: finishedAt,
+            durationMs: finishedAt - startedAt,
+            strictAttempt: attempt,
+            ...(hostResult.tokens !== undefined ? { tokens: hostResult.tokens } : {}),
+            toolCalls: attempt.evidence.toolCallStartedCount,
+            ...(attempt.outcome === "selected"
+              ? {}
+              : { error: attempt.failure?.message ?? "Strict attempt failed." }),
+          }]);
+          recordJournal?.({
+            index,
+            key: routeKey,
+            ok: attempt.outcome === "selected",
+            kind: "strict-attempt",
+            strict: {
+              contractVersion: STRICT_AGENT_CONTRACT_VERSION,
+              launchId,
+              agentType: validation.agentType,
+              requestedEffort: payload.effort,
+              attempt,
+            },
+          });
+
+          if (attempt.outcome === "selected") {
+            const observedModel = attempt.observedModel;
+            const observedEffort = attempt.observedEffort;
+            if (observedModel === undefined || observedEffort === undefined) {
+              throw new WorkflowRuntimeError("A selected strict attempt omitted runtime observations.");
+            }
+            const resultValue = compiledSchema === undefined
+              ? hostResult.text ?? ""
+              : JSON.parse(hostResult.text ?? "null");
+            const route: StrictRouteResult = {
+              contractVersion: STRICT_AGENT_CONTRACT_VERSION,
+              launchId,
+              agentType: validation.agentType,
+              requestedEffort: payload.effort,
+              outcome: "succeeded",
+              attempts,
+              selected: {
+                candidateIndex,
+                requestedModel,
+                observedModel,
+                requestedEffort: payload.effort,
+                // The mismatch branch above already made any other effective
+                // value terminal, so a selected route necessarily equals this.
+                observedEffort: payload.effort,
+              },
+              result: resultValue,
+            };
+            assertBoundarySafe(route, "strictAgent() result");
+            respond(callId, true, route);
+            return;
+          }
+
+          const failure = attempt.failure ?? {
+            code: "RUNTIME_FAILED" as const,
+            message: "Strict attempt failed without a typed reason.",
+          };
+          if (canAdvanceStrictRoute(attempt) && candidateIndex < candidates.length - 1) continue;
+
+          const routeFailure = canAdvanceStrictRoute(attempt)
+            ? {
+                code: "ROUTE_EXHAUSTED" as const,
+                message: `Strict route exhausted ${attempts.length} candidate${attempts.length === 1 ? "" : "s"}.`,
+              }
+            : failure;
+          const route: StrictRouteResult = {
+            contractVersion: STRICT_AGENT_CONTRACT_VERSION,
+            launchId,
+            agentType: validation.agentType,
+            requestedEffort: payload.effort,
+            outcome: "failed",
+            attempts,
+            failure: routeFailure,
+          };
+          assertBoundarySafe(route, "strictAgent() result");
+          respond(callId, true, route);
+          return;
+        }
+      } catch (error) {
+        respond(
+          callId,
+          false,
+          undefined,
+          error instanceof Error ? error.message : String(error),
+          true,
+        );
+      } finally {
+        reservedAgentSlots -= remainingReservation;
+        if (acquired) semaphore.release();
+      }
+    }
+
     /**
      * Resolve one `workflow(ref)` and hand the child's source back compiled.
      *
@@ -1176,6 +1752,10 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
         case "call":
           if (message.method === "workflow") {
             void handleLoadWorkflow(message.callId, message.payload as WorkflowScriptRef);
+            break;
+          }
+          if (message.method === "strictAgent") {
+            void handleStrictAgent(message.callId, message.payload as StrictAgentCallPayload);
             break;
           }
           if (message.method !== "agent") {

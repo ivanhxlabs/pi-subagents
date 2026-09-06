@@ -225,6 +225,158 @@ describe("Workflow end to end", () => {
     }
   }, 90_000);
 
+  it("enforces strict exact routing before a real faux child executes", async () => {
+    const script = [
+      'export const meta = { name: "e2e-strict", description: "strict route evidence" };',
+      'return await strictAgent("STRICT-TASK-MARKER", {',
+      '  contractVersion: 1,',
+      '  agentType: "general-purpose",',
+      '  model: "faux/missing",',
+      '  fallbackModels: ["faux/faux-1"],',
+      '  effort: "high"',
+      '});',
+    ].join("\n");
+    const childPrompts: string[] = [];
+    const cwd = workflowProject();
+    const run = await runPrintMode({
+      prompt: "run the strict workflow",
+      cwd,
+      maxModelCalls: 32,
+      fauxReasoning: true,
+      live: false,
+      respond: context => {
+        const isParent = (context.tools ?? []).some(t => t.name === "SubagentWorkflow");
+        if (!isParent) {
+          childPrompts.push(asText(context));
+          return fauxText("STRICT-DONE");
+        }
+        return asText(context).includes("Task ID")
+          ? fauxText("workflow launched")
+          : workflowCall(script, "wf-call-strict");
+      },
+    });
+
+    try {
+      const settled = await waitFor(() =>
+        journalsFor(cwd).some(path =>
+          readJournal(path).some(entry => entry.kind === "strict-attempt")),
+      );
+      expect(settled).toBe(true);
+      await run.manager?.waitForAll();
+      expect(childPrompts.some(prompt => prompt.includes("STRICT-TASK-MARKER"))).toBe(true);
+
+      const strictEntries = journalsFor(cwd)
+        .flatMap(path => readJournal(path))
+        .filter(entry => entry.kind === "strict-attempt");
+      expect(strictEntries).toHaveLength(2);
+      expect(strictEntries[0]).toMatchObject({
+        ok: false,
+        strict: {
+          attempt: {
+            candidateIndex: 0,
+            requestedModel: "faux/missing",
+            outcome: "pre-execution-failure",
+            failure: { code: "MODEL_UNAVAILABLE" },
+            evidence: {
+              executionStarted: false,
+              assistantMessageStartedCount: 0,
+              assistantOutputEventCount: 0,
+              toolCallStartedCount: 0,
+            },
+          },
+        },
+      });
+      expect(strictEntries[1]).toMatchObject({
+        ok: true,
+        strict: {
+          contractVersion: 1,
+          agentType: "general-purpose",
+          requestedEffort: "high",
+          attempt: {
+            candidateIndex: 1,
+            requestedModel: "faux/faux-1",
+            observedModel: "faux/faux-1",
+            observedEffort: "high",
+            outcome: "selected",
+            evidence: {
+              executionStarted: true,
+              toolCallStartedCount: 0,
+            },
+          },
+        },
+      });
+      expect(strictEntries.every(entry => !("text" in entry))).toBe(true);
+      expect(strictEntries[1].strict?.attempt.evidence.assistantMessageStartedCount)
+        .toBeGreaterThan(0);
+      expect(strictEntries[1].strict?.attempt.evidence.assistantOutputEventCount)
+        .toBeGreaterThan(0);
+    } finally {
+      await run.dispose?.();
+    }
+  }, 90_000);
+
+  it("composes strict routing with StructuredOutput and tool-start evidence", async () => {
+    const script = [
+      'export const meta = { name: "e2e-strict-schema", description: "strict structured evidence" };',
+      'return await strictAgent("STRICT-SCHEMA-MARKER", {',
+      '  contractVersion: 1,',
+      '  agentType: "general-purpose",',
+      '  model: "faux/faux-1",',
+      '  fallbackModels: [],',
+      '  effort: "high",',
+      '  schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] }',
+      '});',
+    ].join("\n");
+    const cwd = workflowProject();
+    const run = await runPrintMode({
+      prompt: "run the strict schema workflow",
+      cwd,
+      maxModelCalls: 32,
+      fauxReasoning: true,
+      live: false,
+      respond: context => {
+        const isParent = (context.tools ?? []).some(t => t.name === "SubagentWorkflow");
+        if (!isParent) {
+          const text = asText(context);
+          return text.includes("Recorded.")
+            ? fauxText("done")
+            : fauxToolCall("StructuredOutput", { answer: "structured" }, { id: "strict-so-1" });
+        }
+        return asText(context).includes("Task ID")
+          ? fauxText("workflow launched")
+          : workflowCall(script, "wf-call-strict-schema");
+      },
+    });
+
+    try {
+      const settled = await waitFor(() =>
+        journalsFor(cwd).some(path =>
+          readJournal(path).some(entry =>
+            entry.kind === "strict-attempt" && entry.strict?.attempt.outcome === "selected")),
+      );
+      expect(settled).toBe(true);
+      await run.manager?.waitForAll();
+      const entry = journalsFor(cwd)
+        .flatMap(path => readJournal(path))
+        .find(candidate => candidate.kind === "strict-attempt");
+      expect(entry).toMatchObject({
+        ok: true,
+        strict: {
+          attempt: {
+            outcome: "selected",
+            evidence: {
+              executionStarted: true,
+              toolCallStartedCount: 1,
+            },
+          },
+        },
+      });
+      expect(entry).not.toHaveProperty("text");
+    } finally {
+      await run.dispose?.();
+    }
+  }, 90_000);
+
   it("surfaces a script that fails to parse instead of launching it", async () => {
     const childPrompts: string[] = [];
 

@@ -17,6 +17,7 @@ import {
   failWorkflowTask,
   pauseWorkflowTask,
   resumeWorkflowTask,
+  updateWorkflowProgressBatch,
   type WorkflowTask,
 } from "../src/workflow/task.js";
 
@@ -89,6 +90,60 @@ describe("pausing a run", () => {
     expect(resumeWorkflowTask(task, 3_000)).toBe(true);
     expect(resumeWorkflowTask(task, 4_000)).toBe(false);
     expect(control.resume).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("strict fallback progress", () => {
+  it("keeps the cached task count aligned with strict-aware progress", () => {
+    const task = createWorkflowTask({ id: "wf_strict", script: "" });
+    updateWorkflowProgressBatch(task, [{
+      type: "workflow_agent",
+      index: 0,
+      label: "primary",
+      state: "error",
+      strictRoute: true,
+      strictLaunchId: "strict-1",
+      strictAttempt: {
+        attemptId: "strict-1:0",
+        candidateIndex: 0,
+        requestedModel: "provider/primary",
+        outcome: "pre-execution-failure",
+        failure: { code: "MODEL_UNAVAILABLE", message: "missing" },
+        evidence: {
+          executionStarted: false,
+          assistantMessageStartedCount: 0,
+          assistantOutputEventCount: 0,
+          toolCallStartedCount: 0,
+        },
+      },
+    }]);
+    expect(task.doneCount).toBe(0);
+
+    updateWorkflowProgressBatch(task, [{
+      type: "workflow_agent",
+      index: 1,
+      label: "fallback",
+      state: "done",
+      strictRoute: true,
+      strictLaunchId: "strict-1",
+      strictAttempt: {
+        attemptId: "strict-1:1",
+        candidateIndex: 1,
+        requestedModel: "provider/fallback",
+        observedModel: "provider/fallback",
+        observedEffort: "high",
+        outcome: "selected",
+        evidence: {
+          executionStarted: true,
+          assistantMessageStartedCount: 1,
+          assistantOutputEventCount: 1,
+          toolCallStartedCount: 0,
+        },
+      },
+    }]);
+
+    expect(task.doneCount).toBe(2);
+    expect(task.agentCount).toBe(2);
   });
 });
 

@@ -20,6 +20,7 @@
  * unit-testable without a terminal.
  */
 
+import { canAdvanceStrictRoute, type StrictAttemptReceipt } from "../strict-agent.js";
 import type { WorkflowMeta, WorkflowPhaseMeta } from "./meta.js";
 
 /** Raw entry lifecycle, as written by the runtime. */
@@ -110,6 +111,12 @@ export interface WorkflowAgentEntry {
   tokens?: number;
   toolCalls?: number;
   durationMs?: number;
+  /** Marks a live row as runtime-controlled strict routing. */
+  strictRoute?: true;
+  /** Groups strict attempts that belong to one public route launch. */
+  strictLaunchId?: string;
+  /** Runtime-owned strict route evidence for this attempt, when settled. */
+  strictAttempt?: StrictAttemptReceipt;
 }
 
 export type WorkflowEntry = WorkflowPhaseEntry | WorkflowLogEntry | WorkflowAgentEntry;
@@ -210,6 +217,18 @@ function groupByPhase(
   return [...byPhase.values()].sort((a, b) => a.phaseIndex - b.phaseIndex);
 }
 
+function acceptedStrictFallback(
+  entry: WorkflowAgentEntry,
+  selectedLaunches: ReadonlySet<string>,
+): boolean {
+  return (
+    entry.strictLaunchId !== undefined &&
+    entry.strictAttempt !== undefined &&
+    canAdvanceStrictRoute(entry.strictAttempt) &&
+    selectedLaunches.has(entry.strictLaunchId)
+  );
+}
+
 /** Roll a phase's agents up into the counts and totals its header shows. */
 function summarize(group: { title: string; agents: WorkflowAgentEntry[] }): PhaseGroup {
   let done = 0;
@@ -217,9 +236,14 @@ function summarize(group: { title: string; agents: WorkflowAgentEntry[] }): Phas
   let tokens = 0;
   let minStart = Number.POSITIVE_INFINITY;
   let maxProgress = 0;
+  const selectedLaunches = new Set(
+    group.agents
+      .filter(agent => agent.strictAttempt?.outcome === "selected")
+      .flatMap(agent => agent.strictLaunchId ?? []),
+  );
 
   for (const agent of group.agents) {
-    if (agent.state === "done") done++;
+    if (agent.state === "done" || acceptedStrictFallback(agent, selectedLaunches)) done++;
     else if (agent.state === "error") failed++;
     if (agent.tokens) tokens += agent.tokens;
     if (agent.startedAt != null) {
@@ -322,16 +346,21 @@ export function buildPhaseGroups(
  * agents start, so the total does not visibly climb as they trickle in.
  */
 export function stats(progress: readonly WorkflowEntry[], agentCount = 0): WorkflowStats {
+  const agents = collapse(progress).agents;
+  const selectedLaunches = new Set(
+    agents
+      .filter(agent => agent.strictAttempt?.outcome === "selected")
+      .flatMap(agent => agent.strictLaunchId ?? []),
+  );
   let seen = 0;
   let done = 0;
   let failed = 0;
   let started = 0;
   let anyLive = false;
 
-  for (const entry of progress) {
-    if (entry.type !== "workflow_agent") continue;
+  for (const entry of agents) {
     seen++;
-    if (entry.state === "done") {
+    if (entry.state === "done" || acceptedStrictFallback(entry, selectedLaunches)) {
       done++;
       started++;
     } else if (entry.state === "error") {

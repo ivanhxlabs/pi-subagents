@@ -4,6 +4,7 @@ import { SPINNER } from "../src/ui/agent-widget.js";
 import { styleWorkflowCardLines, type WorkflowCardTask } from "../src/ui/workflow-card.js";
 import {
   ASCII_DIALOG_GLYPHS,
+  agentActions,
   DEFAULT_PANE_BODY_ROWS,
   dialogRowGlyph,
   handleWorkflowDialogKey,
@@ -653,6 +654,16 @@ describe("keys", () => {
     expect(pressMixed("r", 0)).toBeUndefined();
   });
 
+  it("offers no per-attempt controls for runtime-owned strict routes", () => {
+    const strict = agentEntry({
+      index: 4,
+      state: "progress",
+      startedAt: START,
+      strictRoute: true,
+    });
+    expect(agentActions(strict, true)).toEqual({ skip: false, retry: false });
+  });
+
   it("refuses both on an agent that has already settled", () => {
     // Its `agent()` call has its value; there is nothing left to skip or redo.
     expect(pressMixed("s", 2)).toBeUndefined();
@@ -1032,6 +1043,23 @@ describe("key hints reflect the wired actions", () => {
     const hints = agentHints({ progress: queued });
     expect(hints).toContain("s skip");
     // There is no child to stop and start again yet.
+    expect(hints).not.toContain("r retry");
+  });
+
+  it("offers neither for a live strict route attempt", () => {
+    const strict: WorkflowEntry[] = [
+      {
+        type: "workflow_agent",
+        index: 0,
+        label: "strict",
+        phaseIndex: 0,
+        state: "progress",
+        startedAt: START,
+        strictRoute: true,
+      },
+    ];
+    const hints = agentHints({ progress: strict });
+    expect(hints).not.toContain("s skip");
     expect(hints).not.toContain("r retry");
   });
 

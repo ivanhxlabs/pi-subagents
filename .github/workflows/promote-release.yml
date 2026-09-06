@@ -1,0 +1,143 @@
+name: Promote maintained-fork release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Signed immutable release tag to validate and promote
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pi-subagents-latest-promotion
+  cancel-in-progress: false
+
+jobs:
+  validate-and-promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the release approver
+        env:
+          RELEASE_APPROVER: iamivanhx
+        run: test "$GITHUB_ACTOR" = "$RELEASE_APPROVER"
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.release_tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+
+      - name: Validate immutable release identity
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v0\.19\.0-ivanhxlabs\.[1-9][0-9]*$ ]]; then
+            echo "Unsupported release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          test "$(git cat-file -t "$RELEASE_TAG")" = tag
+          tag_object_sha=$(git rev-parse "${RELEASE_TAG}^{tag}")
+          release_commit=$(git rev-parse "${RELEASE_TAG}^{commit}")
+          package_version=$(node -p "require('./package.json').version")
+          test "v${package_version}" = "$RELEASE_TAG"
+
+          git -c gpg.ssh.allowedSignersFile=docs/release-signers verify-tag "$RELEASE_TAG"
+          gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            | jq -e '.verification.verified == true and .verification.reason == "valid"' >/dev/null
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            | jq -e '.draft == false and .prerelease == false' >/dev/null
+
+          git fetch origin master
+          git merge-base --is-ancestor "$release_commit" origin/master
+
+          echo "tag_object_sha=$tag_object_sha" >> "$GITHUB_OUTPUT"
+          echo "release_commit=$release_commit" >> "$GITHUB_OUTPUT"
+          echo "package_version=$package_version" >> "$GITHUB_OUTPUT"
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run test
+      - run: npm run test:e2e
+      - run: npm run build
+
+      - name: Verify committed build is current
+        run: test -z "$(git status --short --untracked-files=all -- dist)"
+
+      - name: Validate exact tag in an isolated Pi environment
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+          PI_CODING_AGENT_DIR: ${{ runner.temp }}/pi-agent
+          RELEASE_COMMIT: ${{ steps.release.outputs.release_commit }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source="git:github.com/ivanhxlabs/pi-subagents@${RELEASE_TAG}"
+          pi_cli=(npx --yes @earendil-works/pi-coding-agent@0.85.1)
+
+          "${pi_cli[@]}" install "$source"
+          "${pi_cli[@]}" list | tee "$RUNNER_TEMP/pi-list.txt"
+          "${pi_cli[@]}" --help > "$RUNNER_TEMP/pi-help.txt"
+
+          jq -e --arg source "$source" '.packages == [$source]' \
+            "$PI_CODING_AGENT_DIR/settings.json" >/dev/null
+          grep -F -- '--subagents-workflow-file' "$RUNNER_TEMP/pi-help.txt" >/dev/null
+
+          checkout="$PI_CODING_AGENT_DIR/git/github.com/ivanhxlabs/pi-subagents"
+          test "$(git -C "$checkout" rev-parse HEAD)" = "$RELEASE_COMMIT"
+          test -z "$(git -C "$checkout" status --short)"
+          test "$(node -p "require('$checkout/package.json').version")" \
+            = "${RELEASE_TAG#v}"
+
+      - name: Move the latest update channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.release_commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if current_latest=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/latest" --jq .object.sha 2>/dev/null); then
+            if [[ "$current_latest" != "$RELEASE_COMMIT" ]]; then
+              git merge-base --is-ancestor "$current_latest" "$RELEASE_COMMIT"
+              gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/latest" \
+                -f sha="$RELEASE_COMMIT" -F force=true >/dev/null
+            fi
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref='refs/tags/latest' -f sha="$RELEASE_COMMIT" >/dev/null
+          fi
+
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/latest" --jq .object.sha)" \
+            = "$RELEASE_COMMIT"
+
+      - name: Record promotion summary
+        env:
+          PACKAGE_VERSION: ${{ steps.release.outputs.package_version }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.release_commit }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          {
+            echo '## Promoted maintained-fork release'
+            echo
+            echo "- Tag: \`$RELEASE_TAG\`"
+            echo "- Commit: \`$RELEASE_COMMIT\`"
+            echo "- Package: \`@tintinweb/pi-subagents@$PACKAGE_VERSION\`"
+            echo '- Channel: `latest`'
+            echo '- Isolated host: `@earendil-works/pi-coding-agent@0.85.1`'
+          } >> "$GITHUB_STEP_SUMMARY"

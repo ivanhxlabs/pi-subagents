@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Schema-bearing workflow children no longer require redundant final prose after valid structured output.** A clean empty `stop` after an accepted `StructuredOutput` payload now succeeds for ordinary and strict workflow agents, while provider, token-limit, tool, and schema failures remain terminal. ([ivanhxlabs/skills#162](https://github.com/ivanhxlabs/skills/issues/162))
+
 ## [0.19.0-ivanhxlabs.2] - 2026-09-06
 
 ### Fixed

@@ -246,6 +246,8 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 | `resume` | string | Continue the child that ran under that label instead of starting fresh |
 | `schema` | object | A JSON Schema with an object root. Resolves to the validated object instead of text |
 
+Once `StructuredOutput` accepts a payload, that payload is the answer. A provider may then end with a clean `stop` and no prose; the schema-bearing call still succeeds. Provider errors, empty token-limit exhaustion, failed tools, and missing or invalid structured payloads remain terminal failures.
+
 Any other key is rejected **by name** at the call. Note that this checks option *keys*, not option *values* — an `agentType` that names no known agent falls back to `general-purpose` silently.
 
 Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.

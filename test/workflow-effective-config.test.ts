@@ -13,6 +13,9 @@
  * feeds it: the host reading the record's snapshot and handing it over.
  */
 
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", () => ({
@@ -31,7 +34,11 @@ import { AgentManager } from "../src/agent-manager.js";
 import { runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
 import { createWorkflowHost } from "../src/workflow/host.js";
-import type { WorkflowSpawnRequest } from "../src/workflow/runtime.js";
+import type {
+  WorkflowSpawnRequest,
+  WorkflowStrictAgentRequest,
+  WorkflowStrictAttemptRequest,
+} from "../src/workflow/runtime.js";
 import { ctx } from "./helpers/boot-extension.js";
 
 const pi = {} as any;
@@ -75,6 +82,71 @@ function childSessionReports(session: { model?: unknown; thinkingLevel?: string 
   vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, _prompt: any, opts: any) => {
     opts.onSessionCreated?.({ dispose: vi.fn(), ...session } as any);
     return { responseText: "done", session: { dispose: vi.fn() } as any, aborted: false, steered: false };
+  });
+}
+
+const STRICT_AGENT_TYPE = {
+  name: "hx-reviewer-a",
+  description: "Strict reviewer",
+  builtinToolNames: ["read"],
+  extensions: false,
+  skills: false,
+  systemPrompt: "Review.",
+  promptMode: "replace",
+} as const;
+
+function strictRegistry(model?: { provider: string; id: string; name?: string }) {
+  const models = model === undefined ? [] : [model];
+  return {
+    find: vi.fn((provider: string, id: string) =>
+      models.find(entry => entry.provider === provider && entry.id === id)),
+    getAll: vi.fn(() => models),
+    getAvailable: vi.fn(() => models),
+    runtime: {
+      getModel: vi.fn(),
+      getAvailable: vi.fn(async () => models),
+      hasConfiguredAuth: vi.fn(() => true),
+    },
+  };
+}
+
+function strictValidationRequest(): WorkflowStrictAgentRequest {
+  return {
+    contractVersion: 1,
+    prompt: "review",
+    agentType: "hx-reviewer-a",
+    model: "provider/exact",
+    fallbackModels: [],
+    effort: "high",
+  };
+}
+
+function strictAttemptRequest(
+  overrides: Partial<WorkflowStrictAttemptRequest> = {},
+): WorkflowStrictAttemptRequest {
+  return {
+    launchId: "strict_launch",
+    attemptId: "strict_launch:0",
+    agentId: "wf-strict-0",
+    candidateIndex: 0,
+    prompt: "review",
+    agentType: "hx-reviewer-a",
+    model: "provider/exact",
+    effort: "high",
+    ...overrides,
+  };
+}
+
+function createStrictHost(
+  manager: AgentManager,
+  modelRegistry: ReturnType<typeof strictRegistry>,
+  agentConfig: Record<string, unknown> = STRICT_AGENT_TYPE,
+) {
+  return createWorkflowHost({
+    pi,
+    ctx: ctx({ modelRegistry }),
+    manager,
+    strictAgentRegistry: new Map([["hx-reviewer-a", agentConfig as any]]),
   });
 }
 
@@ -212,5 +284,266 @@ describe("the workflow host reports a child's effective configuration", () => {
     expect(recordId).toBeTruthy();
     expect(recordId).not.toBe("wf-agent-0");
     expect(manager.getRecord(recordId!)).toBeDefined();
+  });
+});
+
+describe("the workflow host strict attempt boundary", () => {
+  let manager: AgentManager;
+  const model = { provider: "provider", id: "exact", name: "Exact" };
+
+  beforeEach(() => {
+    vi.mocked(runAgent).mockReset();
+    registerAgents(new Map([["hx-reviewer-a", STRICT_AGENT_TYPE as any]]));
+    manager = new AgentManager();
+  });
+
+  it("keeps strict role resolution scoped to each session cwd", () => {
+    const a = mkdtempSync(join(tmpdir(), "strict-registry-a-"));
+    const b = mkdtempSync(join(tmpdir(), "strict-registry-b-"));
+    const agentFile = (name: string) => [
+      "---",
+      `name: ${name}`,
+      `description: ${name}`,
+      "tools: read",
+      "extensions: false",
+      "skills: false",
+      "---",
+      "Review.",
+    ].join("\n");
+    try {
+      mkdirSync(join(a, ".pi", "agents"), { recursive: true });
+      mkdirSync(join(b, ".pi", "agents"), { recursive: true });
+      writeFileSync(join(a, ".pi", "agents", "strict-a.md"), agentFile("strict-a"));
+      writeFileSync(join(b, ".pi", "agents", "strict-b.md"), agentFile("strict-b"));
+      const modelRegistry = strictRegistry(model);
+      const hostA = createWorkflowHost({ pi, ctx: ctx({ cwd: a, modelRegistry }), manager });
+      const hostB = createWorkflowHost({ pi, ctx: ctx({ cwd: b, modelRegistry }), manager });
+
+      expect(hostA.validateStrictAgent?.({
+        ...strictValidationRequest(),
+        agentType: "strict-a",
+      })).toMatchObject({ ok: true, agentType: "strict-a" });
+      expect(hostB.validateStrictAgent?.({
+        ...strictValidationRequest(),
+        agentType: "strict-a",
+      })).toMatchObject({ ok: false, failure: { code: "UNKNOWN_AGENT_TYPE" } });
+      expect(hostB.validateStrictAgent?.({
+        ...strictValidationRequest(),
+        agentType: "strict-b",
+      })).toMatchObject({ ok: true, agentType: "strict-b" });
+    } finally {
+      rmSync(a, { recursive: true, force: true });
+      rmSync(b, { recursive: true, force: true });
+    }
+  });
+
+  it("validates exact session-owned roles without fallback", () => {
+    const host = createStrictHost(manager, strictRegistry(model));
+
+    expect(host.validateStrictAgent?.(strictValidationRequest())).toEqual({
+      ok: true,
+      agentType: "hx-reviewer-a",
+    });
+    expect(host.validateStrictAgent?.({
+      ...strictValidationRequest(),
+      agentType: "HX-REVIEWER-A",
+    })).toMatchObject({ ok: false, failure: { code: "UNKNOWN_AGENT_TYPE" } });
+  });
+
+  it("snapshots caller-provided registries and role objects before validation", async () => {
+    const mutable = {
+      ...STRICT_AGENT_TYPE,
+      isolated: true,
+      builtinToolNames: ["read"],
+    };
+    const registry = new Map([["hx-reviewer-a", mutable as any]]);
+    const host = createWorkflowHost({
+      pi,
+      ctx: ctx({ modelRegistry: strictRegistry(model) }),
+      manager,
+      strictAgentRegistry: registry,
+    });
+    registry.clear();
+    mutable.isolated = false;
+    mutable.builtinToolNames.push("write");
+
+    expect(host.validateStrictAgent?.(strictValidationRequest()))
+      .toMatchObject({ ok: true, agentType: "hx-reviewer-a" });
+    vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, _prompt: any, opts: any) => {
+      const session = { model, thinkingLevel: "high", dispose: vi.fn() } as any;
+      opts.onSessionCreated?.(session);
+      opts.strictAttempt.onObserved({ model: "provider/exact", effort: "high" });
+      opts.strictAttempt.onEvidence({
+        executionStarted: true,
+        assistantMessageStartedCount: 1,
+        assistantOutputEventCount: 1,
+        toolCallStartedCount: 0,
+      });
+      return { responseText: "done", session, aborted: false, steered: false };
+    });
+
+    await host.spawnStrictAttempt?.(strictAttemptRequest());
+
+    expect(vi.mocked(runAgent).mock.calls[0]?.[3].agentConfigOverride).toMatchObject({
+      isolated: true,
+      builtinToolNames: ["read"],
+    });
+  });
+
+  it("returns a selected attempt with runtime observations and start counters", async () => {
+    const registry = strictRegistry(model);
+    vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, _prompt: any, opts: any) => {
+      const session = { model, thinkingLevel: "high", dispose: vi.fn() } as any;
+      opts.onSessionCreated?.(session);
+      opts.strictAttempt.onObserved({ model: "provider/exact", effort: "high" });
+      opts.strictAttempt.onEvidence({
+        executionStarted: true,
+        assistantMessageStartedCount: 1,
+        assistantOutputEventCount: 2,
+        toolCallStartedCount: 1,
+      });
+      return { responseText: "done", session, aborted: false, steered: false };
+    });
+    const host = createStrictHost(manager, registry);
+
+    const result = await host.spawnStrictAttempt?.(strictAttemptRequest());
+
+    expect(result).toMatchObject({
+      text: "done",
+      toolCalls: 1,
+      attempt: {
+        outcome: "selected",
+        observedModel: "provider/exact",
+        observedEffort: "high",
+        evidence: {
+          executionStarted: true,
+          assistantMessageStartedCount: 1,
+          assistantOutputEventCount: 2,
+          toolCallStartedCount: 1,
+        },
+      },
+    });
+    expect(vi.mocked(runAgent).mock.calls[0]?.[3]).toMatchObject({
+      model,
+      agentConfigOverride: STRICT_AGENT_TYPE,
+      thinkingLevel: "high",
+      strictAttempt: expect.any(Object),
+    });
+  });
+
+  it("executes the validated role's isolation and context restrictions", async () => {
+    const restricted = {
+      ...STRICT_AGENT_TYPE,
+      isolated: true,
+      inheritContext: true,
+    };
+    vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, _prompt: any, opts: any) => {
+      const session = { model, thinkingLevel: "high", dispose: vi.fn() } as any;
+      opts.onSessionCreated?.(session);
+      opts.strictAttempt.onObserved({ model: "provider/exact", effort: "high" });
+      opts.strictAttempt.onEvidence({
+        executionStarted: true,
+        assistantMessageStartedCount: 1,
+        assistantOutputEventCount: 1,
+        toolCallStartedCount: 0,
+      });
+      return { responseText: "done", session, aborted: false, steered: false };
+    });
+    const host = createStrictHost(manager, strictRegistry(model), restricted);
+
+    await host.spawnStrictAttempt?.(strictAttemptRequest());
+
+    expect(vi.mocked(runAgent).mock.calls[0]?.[3]).toMatchObject({
+      agentConfigOverride: restricted,
+      isolated: true,
+      inheritContext: true,
+    });
+  });
+
+  it("rejects caller worktree isolation when the validated role refuses it", () => {
+    const host = createStrictHost(manager, strictRegistry(model), {
+      ...STRICT_AGENT_TYPE,
+      isolation: "off",
+    });
+
+    expect(host.validateStrictAgent?.({
+      ...strictValidationRequest(),
+      isolation: "worktree",
+    })).toMatchObject({ ok: false, failure: { code: "INVALID_ISOLATION" } });
+  });
+
+  it("reports unavailable exact models before creating a child", async () => {
+    const host = createStrictHost(manager, strictRegistry());
+
+    const result = await host.spawnStrictAttempt?.(strictAttemptRequest());
+
+    expect(result).toMatchObject({
+      attempt: {
+        outcome: "pre-execution-failure",
+        failure: { code: "MODEL_UNAVAILABLE" },
+        evidence: {
+          executionStarted: false,
+          assistantMessageStartedCount: 0,
+          assistantOutputEventCount: 0,
+          toolCallStartedCount: 0,
+        },
+      },
+    });
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("preserves a typed final-preflight mismatch with zero-execution proof", async () => {
+    vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, _prompt: any, opts: any) => {
+      const session = { model, thinkingLevel: "high", dispose: vi.fn() } as any;
+      opts.onSessionCreated?.(session);
+      opts.strictAttempt.onObserved({ model: "provider/substitute", effort: "high" });
+      opts.strictAttempt.onFailure("CANONICAL_MODEL_MISMATCH", "substituted");
+      throw new Error("substituted");
+    });
+    const host = createStrictHost(manager, strictRegistry(model));
+
+    const result = await host.spawnStrictAttempt?.(strictAttemptRequest());
+
+    expect(result).toMatchObject({
+      attempt: {
+        outcome: "pre-execution-failure",
+        observedModel: "provider/substitute",
+        failure: { code: "CANONICAL_MODEL_MISMATCH" },
+        evidence: { executionStarted: false },
+      },
+    });
+  });
+
+  it("classifies provider failure after handoff as terminal", async () => {
+    vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, _prompt: any, opts: any) => {
+      const session = { model, thinkingLevel: "high", dispose: vi.fn() } as any;
+      opts.onSessionCreated?.(session);
+      opts.strictAttempt.onObserved({ model: "provider/exact", effort: "high" });
+      opts.strictAttempt.onEvidence({
+        executionStarted: true,
+        assistantMessageStartedCount: 1,
+        assistantOutputEventCount: 1,
+        toolCallStartedCount: 0,
+      });
+      opts.strictAttempt.onFailure("PROVIDER_FAILED", "remote refusal");
+      return {
+        responseText: "partial",
+        session,
+        aborted: false,
+        steered: false,
+        failure: "remote refusal",
+      };
+    });
+    const host = createStrictHost(manager, strictRegistry(model));
+
+    const result = await host.spawnStrictAttempt?.(strictAttemptRequest());
+
+    expect(result).toMatchObject({
+      attempt: {
+        outcome: "post-execution-failure",
+        failure: { code: "PROVIDER_FAILED" },
+        evidence: { executionStarted: true },
+      },
+    });
   });
 });

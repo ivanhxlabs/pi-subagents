@@ -26,8 +26,15 @@ import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
+import {
+  emptyStrictExecutionEvidence,
+  type StrictAttemptFailureCode,
+  type StrictEffort,
+  type StrictExecutionEvidence,
+  type StrictObservedEffort,
+} from "./strict-agent.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
-import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentConfig, SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 
@@ -394,12 +401,22 @@ export interface ToolActivity {
   toolName: string;
 }
 
+export interface StrictRunObserver {
+  expectedModel: string;
+  expectedEffort: StrictEffort;
+  onObserved(info: { model: string; effort: StrictObservedEffort }): void;
+  onEvidence(evidence: StrictExecutionEvidence): void;
+  onFailure(code: StrictAttemptFailureCode, message: string): void;
+}
+
 export interface RunOptions {
   /** ExtensionAPI instance — used for pi.exec() instead of execSync. */
   pi: ExtensionAPI;
   /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
   agentId?: string;
   model?: Model<any>;
+  /** Immutable role definition selected by a strict session-owned registry. */
+  agentConfigOverride?: AgentConfig;
   maxTurns?: number;
   signal?: AbortSignal;
   isolated?: boolean;
@@ -483,6 +500,8 @@ export interface RunOptions {
    * fails at the call that wrote it rather than inside the child.
    */
   structuredOutput?: CompiledSchema;
+  /** Final-preflight enforcement and execution evidence for strict workflow attempts. */
+  strictAttempt?: StrictRunObserver;
   /** Runtime bridge for opt-in child-safe nested delegation. */
   nestedRuntime?: {
     manager: NestedAgentManager;
@@ -562,32 +581,57 @@ function getLastAssistantText(session: AgentSession, startIndex = 0): string {
 
 /**
  * Error message of THIS invocation's final assistant message, when that turn
- * failed. Two failure shapes, both keyed off how the final turn STOPPED:
+ * failed. Three failure shapes, all keyed off how the final turn STOPPED:
  *   - stopReason "error": a provider failure pi resolved instead of rejecting
  *     (any text; partial output is surfaced separately).
  *   - stopReason "length" with NO text: a silent max-token death — the run hit
  *     the output-token ceiling before writing anything, which would otherwise
  *     land as a "completed" run with an empty result (the #144 symptom).
- * Everything else completes: a clean "stop"/"toolUse" final, and — crucially — a
- * "length" stop that DID produce text (a legitimate truncated-but-useful answer).
+ *   - any non-"toolUse" stop with NO text: the model ended its final turn
+ *     without writing output — a "stop"/"end_turn" final with an empty text
+ *     block must not report "completed" with a stale fallback answer.
+ * Everything else completes: a "toolUse" stop (never final), and — crucially — a
+ * "length" or "stop" stop that DID produce text (a legitimate truncated or
+ * concluding answer).
  * "aborted" is handled by the manager's abort flag / "stopped" guard, not here.
  * Bounded by `startIndex` (like the text fallback) so a resume that produced no
  * assistant message of its own never inherits a PRIOR turn's stop reason.
  */
-function finalTurnError(session: AgentSession, startIndex = 0): string | undefined {
+function finalTurnFailure(
+  session: AgentSession,
+  startIndex = 0,
+): { message: string; strictCode: "PROVIDER_FAILED" | "CHILD_FAILED" } | undefined {
   for (let i = session.messages.length - 1; i >= startIndex; i--) {
     const msg = session.messages[i];
     if (msg.role !== "assistant") continue;
     if (msg.stopReason === "error") {
-      return (msg as { errorMessage?: string }).errorMessage?.trim() || "provider error with no output";
+      return {
+        message: (msg as { errorMessage?: string }).errorMessage?.trim() || "provider error with no output",
+        strictCode: "PROVIDER_FAILED",
+      };
     }
     if (msg.stopReason === "length" && !extractText(msg.content).trim()) {
-      return "run hit the output token limit before producing any text";
+      return {
+        message: "run hit the output token limit before producing any text",
+        strictCode: "PROVIDER_FAILED",
+      };
+    }
+    if (msg.stopReason !== "toolUse" && !extractText(msg.content).trim()) {
+      return {
+        message: "run ended without producing any text",
+        strictCode: "CHILD_FAILED",
+      };
     }
     return undefined;
   }
   return undefined;
 }
+
+function finalTurnError(session: AgentSession, startIndex = 0): string | undefined {
+  return finalTurnFailure(session, startIndex)?.message;
+}
+
+const AUTH_PREFLIGHT_FAILURE = /authentication failed|no api key found/i;
 
 /**
  * Wire an AbortSignal to abort a session.
@@ -595,7 +639,11 @@ function finalTurnError(session: AgentSession, startIndex = 0): string | undefin
  */
 function forwardAbortSignal(session: AgentSession, signal?: AbortSignal): () => void {
   if (!signal) return () => {};
-  const onAbort = () => session.abort();
+  const onAbort = () => { void session.abort(); };
+  if (signal.aborted) {
+    onAbort();
+    return () => {};
+  }
   signal.addEventListener("abort", onAbort, { once: true });
   return () => signal.removeEventListener("abort", onAbort);
 }
@@ -613,8 +661,19 @@ export async function runAgent(
   prompt: string,
   options: RunOptions,
 ): Promise<RunResult> {
-  const config = getConfig(type);
-  const agentConfig = getAgentConfig(type);
+  const agentConfig = options.agentConfigOverride ?? getAgentConfig(type);
+  const config = options.agentConfigOverride === undefined
+    ? getConfig(type)
+    : {
+        displayName: agentConfig?.displayName ?? agentConfig?.name ?? type,
+        color: agentConfig?.color,
+        description: agentConfig?.description ?? type,
+        builtinToolNames: agentConfig?.builtinToolNames ?? BUILTIN_TOOL_NAMES,
+        extensions: agentConfig?.extensions ?? true,
+        excludeExtensions: agentConfig?.excludeExtensions,
+        skills: agentConfig?.skills ?? true,
+        promptMode: agentConfig?.promptMode ?? "replace" as const,
+      };
 
   // Resolve working directory: worktree override > parent cwd
   const effectiveCwd = options.cwd ?? ctx.cwd;
@@ -647,7 +706,9 @@ export async function runAgent(
     }
   }
 
-  let toolNames = getToolNamesForType(type);
+  let toolNames = options.agentConfigOverride === undefined
+    ? getToolNamesForType(type)
+    : agentConfig?.builtinToolNames ?? [...BUILTIN_TOOL_NAMES];
 
   // Persistent memory: detect write capability and branch accordingly.
   // Account for disallowedTools — a tool in the base set but on the denylist is not truly available.
@@ -1025,6 +1086,46 @@ export async function runAgent(
     },
   });
 
+  let strictEvidence = emptyStrictExecutionEvidence();
+  let strictFailureRecorded = false;
+  const reportStrictEvidence = (patch: Partial<StrictExecutionEvidence>) => {
+    if (options.strictAttempt === undefined) return;
+    strictEvidence = { ...strictEvidence, ...patch };
+    options.strictAttempt.onEvidence({ ...strictEvidence });
+  };
+  const reportStrictFailure = (code: StrictAttemptFailureCode, message: string) => {
+    if (options.strictAttempt === undefined || strictFailureRecorded) return;
+    strictFailureRecorded = true;
+    options.strictAttempt.onFailure(code, message);
+  };
+  const strictPreflight = options.strictAttempt === undefined
+    ? undefined
+    : (success: boolean) => {
+        if (!success) return;
+        const observedModel = session.model
+          ? `${session.model.provider}/${session.model.id}`
+          : "";
+        const observedEffort = session.thinkingLevel;
+        options.strictAttempt?.onObserved({ model: observedModel, effort: observedEffort });
+        if (observedModel !== options.strictAttempt?.expectedModel) {
+          const message =
+            `Strict final preflight selected "${observedModel || "(none)"}" instead of ` +
+            `"${options.strictAttempt?.expectedModel}".`;
+          reportStrictFailure("CANONICAL_MODEL_MISMATCH", message);
+          throw new Error(message);
+        }
+        if (observedEffort !== options.strictAttempt?.expectedEffort) {
+          const message =
+            `Strict final preflight applied effort "${observedEffort}" instead of ` +
+            `"${options.strictAttempt?.expectedEffort}".`;
+          reportStrictFailure("EFFECTIVE_EFFORT_MISMATCH", message);
+          throw new Error(message);
+        }
+        // Conservative handoff: once the callback returns, Pi immediately
+        // commits control to its agent loop. Mark started before returning.
+        reportStrictEvidence({ executionStarted: true });
+      };
+
   // With `allowedToolNames` unset, the registry is scoped by `excludeTools` but
   // the ACTIVE set still needs managing: pi activates only its four default
   // built-ins at turn 1, and `ext:` narrowing has no registry-level expression
@@ -1046,12 +1147,17 @@ export async function runAgent(
 
   // Track turns for graceful max_turns enforcement
   let turnCount = 0;
-  const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
+  let strictAgentStartCount = 0;
+  const maxTurns = options.agentConfigOverride === undefined
+    ? resolveEffectiveMaxTurns(type, options.maxTurns)
+    : normalizeMaxTurns(options.maxTurns ?? agentConfig?.maxTurns ?? defaultMaxTurns);
   let softLimitReached = false;
   let aborted = false;
 
   let currentMessageText = "";
+  let terminalStrictToolFailure: string | undefined;
   const unsubTurns = session.subscribe((event: AgentSessionEvent) => {
+    if (event.type === "agent_start") strictAgentStartCount++;
     if (event.type === "turn_end") {
       turnCount++;
       options.onTurnEnd?.(turnCount);
@@ -1067,15 +1173,34 @@ export async function runAgent(
     }
     if (event.type === "message_start") {
       currentMessageText = "";
+      if (event.message.role === "assistant") {
+        // A later assistant turn means it observed and recovered from any tool
+        // error in the preceding turn. Only an unrecovered final error is terminal.
+        terminalStrictToolFailure = undefined;
+        reportStrictEvidence({
+          assistantMessageStartedCount: strictEvidence.assistantMessageStartedCount + 1,
+        });
+      }
     }
-    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-      currentMessageText += event.assistantMessageEvent.delta;
-      options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
+    if (event.type === "message_update") {
+      reportStrictEvidence({
+        assistantOutputEventCount: strictEvidence.assistantOutputEventCount + 1,
+      });
+      if (event.assistantMessageEvent.type === "text_delta") {
+        currentMessageText += event.assistantMessageEvent.delta;
+        options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
+      }
     }
     if (event.type === "tool_execution_start") {
+      reportStrictEvidence({
+        toolCallStartedCount: strictEvidence.toolCallStartedCount + 1,
+      });
       options.onToolActivity?.({ type: "start", toolName: event.toolName });
     }
     if (event.type === "tool_execution_end") {
+      if (options.strictAttempt !== undefined && event.isError) {
+        terminalStrictToolFailure = `Tool "${event.toolName}" failed before the strict attempt settled.`;
+      }
       options.onToolActivity?.({ type: "end", toolName: event.toolName });
     }
     if (event.type === "message_end" && event.message.role === "assistant") {
@@ -1109,8 +1234,28 @@ export async function runAgent(
   // on counts as this run's output (a fresh session, so usually 0).
   const startLen = session.messages.length;
   let structuredRetried = false;
+  const promptSession = (text: string) => options.strictAttempt === undefined
+    ? session.prompt(text)
+    : session.prompt(text, {
+        expandPromptTemplates: false,
+        ...(strictPreflight !== undefined ? { preflightResult: strictPreflight } : {}),
+      });
   try {
-    await session.prompt(effectivePrompt);
+    await promptSession(effectivePrompt);
+    if (options.strictAttempt !== undefined && strictAgentStartCount === 0) {
+      const message =
+        "Pi accepted strict prompt preflight without entering the child agent loop.";
+      reportStrictFailure("RUNTIME_FAILED", message);
+      throw new Error(message);
+    }
+    if (
+      options.strictAttempt !== undefined &&
+      strictEvidence.assistantMessageStartedCount === 0
+    ) {
+      const message = "Strict child execution ended before an assistant message started.";
+      reportStrictFailure("CHILD_FAILED", message);
+      throw new Error(message);
+    }
 
     // One more prompt when a schema was asked for and nothing usable came back
     // — the model answered in prose, or only ever called the tool invalidly.
@@ -1120,8 +1265,22 @@ export async function runAgent(
     if (structuredCapture !== undefined && structuredCapture.json === undefined
       && !aborted && options.signal?.aborted !== true) {
       structuredRetried = true;
-      await session.prompt(structuredRetryPrompt(structuredCapture));
+      await promptSession(structuredRetryPrompt(structuredCapture));
     }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (options.signal?.aborted) reportStrictFailure("CANCELLED", message || "Strict attempt cancelled.");
+    else if (!strictFailureRecorded) {
+      reportStrictFailure(
+        strictEvidence.executionStarted
+          ? "RUNTIME_FAILED"
+          : AUTH_PREFLIGHT_FAILURE.test(message)
+            ? "AUTH_UNAVAILABLE"
+            : "PREFLIGHT_FAILED",
+        message,
+      );
+    }
+    throw error;
   } finally {
     unsubTurns();
     collector.unsubscribe();
@@ -1137,12 +1296,18 @@ export async function runAgent(
       ? `The agent's StructuredOutput call did not match the required schema: ${structuredCapture.lastError}`
       : "The agent did not report its answer through StructuredOutput."
     : undefined;
+  const turnFailure = finalTurnFailure(session, startLen);
+  if (options.signal?.aborted) reportStrictFailure("CANCELLED", "Strict attempt cancelled.");
+  else if (structuredFailure !== undefined) reportStrictFailure("SCHEMA_REJECTED", structuredFailure);
+  else if (terminalStrictToolFailure !== undefined) reportStrictFailure("TOOL_FAILED", terminalStrictToolFailure);
+  else if (turnFailure !== undefined) reportStrictFailure(turnFailure.strictCode, turnFailure.message);
+  else if (aborted) reportStrictFailure("CHILD_FAILED", "Strict attempt exceeded its turn limit.");
   return {
     responseText,
     session,
     aborted,
     steered: softLimitReached,
-    failure: finalTurnError(session, startLen) ?? structuredFailure,
+    failure: turnFailure?.message ?? structuredFailure ?? terminalStrictToolFailure,
     ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
     ...(structuredRetried ? { structuredRetried } : {}),
   };

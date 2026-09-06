@@ -151,16 +151,13 @@ export function updateWorkflowProgressBatch(
 
   let totalTokens = 0;
   let totalToolCalls = 0;
-  let done = 0;
   for (const agent of agents) {
     totalTokens += agent.tokens ?? 0;
     totalToolCalls += agent.toolCalls ?? 0;
-    // Counted off the collapsed agents, so a re-emitted row counts once.
-    if (agent.state === "done") done++;
   }
   task.totalTokens = totalTokens;
   task.totalToolCalls = totalToolCalls;
-  task.doneCount = done;
+  task.doneCount = stats(task.workflowProgress, task.agentCount).done;
 }
 
 /**

@@ -19,13 +19,13 @@ import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { resumeAgent, runAgent, type StrictRunObserver, type ToolActivity } from "./agent-runner.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
-import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentConfig, AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
-import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
+import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, type WorktreeCleanupResult, } from "./worktree.js";
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
@@ -72,6 +72,14 @@ const DEFAULT_MAX_CONCURRENT_FOREGROUND = 0;
  * far above the handful anyone keeps in their head.
  */
 const MAX_TOMBSTONES = 100;
+
+function applyWorktreeCleanupFailure(record: AgentRecord, result: WorktreeCleanupResult): boolean {
+  if (!result.error || !result.path) return false;
+  const message = `Worktree cleanup failed: ${result.error}\nAgent worktree remains at \`${result.path}\` for recovery.`;
+  record.status = "error";
+  record.error = record.error ? `${record.error}\n${message}` : message;
+  return true;
+}
 
 /**
  * Validate a caller-supplied SpawnOptions.cwd. `undefined`/`null` mean "unset"
@@ -194,6 +202,8 @@ interface SpawnOptions {
    */
   reclaim?: { handle: string; alias?: string };
   model?: Model<any>;
+  /** Immutable role definition selected by a strict session-owned registry. */
+  agentConfigOverride?: AgentConfig;
   maxTurns?: number;
   isolated?: boolean;
   inheritContext?: boolean;
@@ -232,6 +242,8 @@ interface SpawnOptions {
    * compiled schema. Set only by the workflow host, for `agent({ schema })`.
    */
   structuredOutput?: CompiledSchema;
+  /** Final-preflight enforcement and evidence observer for strict workflow attempts. */
+  strictAttempt?: StrictRunObserver;
   /** Isolation mode — "worktree" creates a temp git worktree for the agent. */
   isolation?: IsolationMode;
   /**
@@ -736,6 +748,9 @@ export class AgentManager {
       if (record.status !== "running") {
         releaseSlot();
         record.worktreeResult = await cleanupWorktree(pi, baseCwd, wt, options.description);
+        if (applyWorktreeCleanupFailure(record, record.worktreeResult)) {
+          throw new Error(record.error);
+        }
         this.drainQueue();
         return;
       }
@@ -762,11 +777,13 @@ export class AgentManager {
       pi,
       agentId: id,
       model: options.model,
+      agentConfigOverride: options.agentConfigOverride,
       maxTurns: options.maxTurns,
       isolated: options.isolated,
       inheritContext: options.inheritContext,
       thinkingLevel: options.thinkingLevel,
       structuredOutput: options.structuredOutput,
+      strictAttempt: options.strictAttempt,
       resumeSessionFile: options.resumeSessionFile,
       nested: options.parentAgentId !== undefined,
       workflow: options.workflowId !== undefined,
@@ -890,7 +907,8 @@ export class AgentManager {
           }
           const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
           record.worktreeResult = wtResult;
-          if (wtResult.hasChanges && wtResult.branch) {
+          const cleanupFailed = applyWorktreeCleanupFailure(record, wtResult);
+          if (!cleanupFailed && wtResult.hasChanges && wtResult.branch) {
             // With a caller-supplied cwd the branch lives in THAT repo, not the
             // parent session's — say so, or the orchestrator merges in the wrong repo.
             const repoNote = customCwd !== undefined ? ` in \`${baseCwd}\`` : "";
@@ -928,6 +946,7 @@ export class AgentManager {
           try {
             const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
             record.worktreeResult = wtResult;
+            applyWorktreeCleanupFailure(record, wtResult);
           } catch { /* ignore cleanup errors */ }
         }
 
@@ -1013,7 +1032,7 @@ export class AgentManager {
       const record = this.agents.get(next.id);
       // Stale entries (aborted while queued) are not started — but are still
       // released, since nothing else will.
-      if (!record || record.status !== "queued") { next.release(); continue; }
+      if (record?.status !== "queued") { next.release(); continue; }
       // Detached, and never rejects: a late failure (e.g. strict worktree
       // isolation) lands on the record inside `launch`, exactly as the
       // synchronous throw did here before, and draining continues either way.

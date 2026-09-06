@@ -8,10 +8,85 @@ export interface ModelEntry {
   provider: string;
 }
 
-export interface ModelRegistry {
-  find(provider: string, modelId: string): any;
-  getAll(): any[];
-  getAvailable?(): any[];
+export interface ModelRegistry<TModel extends ModelEntry = ModelEntry> {
+  find(provider: string, modelId: string): TModel | undefined;
+  getAll(): TModel[];
+  getAvailable?(): TModel[];
+}
+
+const EXACT_QUALIFIED_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:@+/-]*$/;
+
+export function isExactQualifiedModelId(input: string): boolean {
+  const slash = input.indexOf("/");
+  return (
+    slash > 0 &&
+    slash < input.length - 1 &&
+    EXACT_QUALIFIED_MODEL_ID.test(input)
+  );
+}
+
+export type ExactModelResolution<TModel extends ModelEntry = ModelEntry> =
+  | { ok: true; model: TModel; canonicalId: string }
+  | { ok: false; code: "INVALID_MODEL_ID" | "MODEL_UNAVAILABLE" | "AUTH_UNAVAILABLE"; message: string };
+
+/**
+ * Resolve one exact, case-sensitive qualified model id without fuzzy spelling,
+ * date normalization or cross-provider fallback.
+ *
+ * Registration and authentication are deliberately separate. A registered
+ * exact model that is absent from `getAvailable()` is an auth refusal; an id
+ * absent from the registry is unavailable. The strict route runtime uses that
+ * distinction to produce stable failure codes before child execution.
+ */
+export function resolveExactAvailableModel<TModel extends ModelEntry>(
+  input: string,
+  registry: ModelRegistry<TModel>,
+): ExactModelResolution<TModel> {
+  const slash = input.indexOf("/");
+  if (!isExactQualifiedModelId(input)) {
+    return {
+      ok: false,
+      code: "INVALID_MODEL_ID",
+      message: `Strict model ids must be exact qualified provider/model ids: "${input}".`,
+    };
+  }
+
+  const provider = input.slice(0, slash);
+  const modelId = input.slice(slash + 1);
+  const registered = registry.getAll().find(
+    model => model.provider === provider && model.id === modelId,
+  );
+  const found = registry.find(provider, modelId);
+  if (registered === undefined || found === undefined) {
+    return {
+      ok: false,
+      code: "MODEL_UNAVAILABLE",
+      message: `Exact model is not registered: "${input}".`,
+    };
+  }
+
+  const canonicalId = `${registered.provider}/${registered.id}`;
+  if (canonicalId !== input) {
+    return {
+      ok: false,
+      code: "MODEL_UNAVAILABLE",
+      message: `Exact model is not registered: "${input}".`,
+    };
+  }
+
+  const available = registry.getAvailable?.();
+  if (
+    available !== undefined &&
+    !available.some(model => `${model.provider}/${model.id}` === input)
+  ) {
+    return {
+      ok: false,
+      code: "AUTH_UNAVAILABLE",
+      message: `Authentication is unavailable for exact model "${input}".`,
+    };
+  }
+
+  return { ok: true, model: found, canonicalId };
 }
 
 /**
@@ -37,12 +112,12 @@ export function describeModel(
  * Tries exact match first ("provider/modelId"), then fuzzy match against all available models.
  * Returns the Model on success, or an error message string on failure.
  */
-export function resolveModel(
+export function resolveModel<TModel extends ModelEntry>(
   input: string,
-  registry: ModelRegistry,
-): any | string {
+  registry: ModelRegistry<TModel>,
+): TModel | string {
   // Available models (those with auth configured)
-  const all = (registry.getAvailable?.() ?? registry.getAll()) as ModelEntry[];
+  const all = registry.getAvailable?.() ?? registry.getAll();
   const availableSet = new Set(all.map(m => `${m.provider}/${m.id}`.toLowerCase()));
 
   // 1. Exact match: "provider/modelId" — only if available (has auth)
@@ -63,8 +138,7 @@ export function resolveModel(
   const query = normalize(input);
 
   // Score each model: prefer exact id match > id contains > name contains > provider+id contains
-  let bestMatch: ModelEntry | undefined;
-  let bestScore = 0;
+  let bestMatch: TModel | undefined;  let bestScore = 0;
 
   for (const m of all) {
     const id = normalize(m.id);

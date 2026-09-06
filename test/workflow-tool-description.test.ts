@@ -39,6 +39,7 @@ function stringArray(name: string): string[] {
 }
 
 const AGENT_OPTIONS = stringArray("AGENT_OPTIONS");
+const STRICT_AGENT_OPTIONS = stringArray("STRICT_AGENT_OPTIONS");
 const EFFORT_LEVELS = stringArray("EFFORT_LEVELS");
 
 /** Options the runtime refuses to combine with `resume`, per its own messages. */
@@ -96,6 +97,21 @@ describe("the agent() contract it documents", () => {
     const listed = description.match(/reasoning effort for this agent call \(([^)]*)\)/)?.[1] ?? "";
     const quoted = [...listed.matchAll(/'(\w+)'/g)].map(m => m[1]);
     expect(quoted).toEqual(EFFORT_LEVELS);
+  });
+});
+
+describe("the strictAgent() contract it documents", () => {
+  it("names every versioned strict option", () => {
+    for (const option of STRICT_AGENT_OPTIONS) {
+      expect(description, `strictAgent() ${option} is undocumented`).toContain(option);
+    }
+  });
+
+  it("states the exact retry boundary and non-replay guarantee", () => {
+    expect(description).toContain("distinct, exact, case-sensitive qualified IDs");
+    expect(description).toContain("explicit zero-execution/output/tool-start evidence");
+    expect(description).toContain("cannot be replayed with resumeFromRunId");
+    expect(description).toContain("Ordinary agent() behavior is unchanged");
   });
 });
 

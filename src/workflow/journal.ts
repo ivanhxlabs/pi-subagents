@@ -46,6 +46,7 @@
 
 import { createHash } from "node:crypto";
 import { appendFileSync, readFileSync } from "node:fs";
+import type { StrictAttemptReceipt, StrictEffort } from "../strict-agent.js";
 
 /** One settled agent call, as replayed. */
 export interface WorkflowJournalEntry {
@@ -67,6 +68,18 @@ export interface WorkflowJournalEntry {
    * partway through, which is why the flag is on the journal and not derived.
    */
   resumed?: true;
+  /**
+   * Strict attempt evidence is durable but never replayable. A later run stops
+   * at the first such entry with `STRICT_REPLAY_UNSUPPORTED`.
+   */
+  kind?: "strict-attempt";
+  strict?: {
+    contractVersion: 1;
+    launchId: string;
+    agentType: string;
+    requestedEffort: StrictEffort;
+    attempt: StrictAttemptReceipt;
+  };
 }
 
 /**
@@ -76,6 +89,31 @@ export interface WorkflowJournalEntry {
  * row around in the progress tree without changing a single token the agent
  * sees, so re-grouping phases should not throw away an hour of results.
  */
+export interface StrictJournalKeyInput {
+  contractVersion: 1;
+  prompt: string;
+  agentType: string;
+  model: string;
+  fallbackModels: readonly string[];
+  effort: StrictEffort;
+  isolation?: string;
+  schema?: string;
+}
+
+/** Stable key for a strict route. Attempt evidence is deliberately excluded. */
+export function strictJournalKey(input: StrictJournalKeyInput): string {
+  return createHash("sha256").update(JSON.stringify([
+    input.contractVersion,
+    input.prompt,
+    input.agentType,
+    input.model,
+    input.fallbackModels,
+    input.effort,
+    input.isolation ?? null,
+    input.schema ?? null,
+  ])).digest("hex").slice(0, 32);
+}
+
 export interface JournalKeyInput {
   prompt: string;
   label?: string;
@@ -159,6 +197,30 @@ function isEntry(value: unknown): value is WorkflowJournalEntry {
     typeof entry.key === "string" &&
     typeof entry.ok === "boolean" &&
     (entry.text === undefined || typeof entry.text === "string") &&
-    (entry.resumed === undefined || entry.resumed === true)
+    (entry.resumed === undefined || entry.resumed === true) &&
+    (entry.kind === undefined || entry.kind === "strict-attempt") &&
+    (entry.strict === undefined || isStrictJournalPayload(entry.strict))
+  );
+}
+
+function isStrictJournalPayload(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const strict = value as Record<string, unknown>;
+  if (
+    strict.contractVersion !== 1 ||
+    typeof strict.launchId !== "string" ||
+    typeof strict.agentType !== "string" ||
+    typeof strict.requestedEffort !== "string" ||
+    typeof strict.attempt !== "object" ||
+    strict.attempt === null
+  ) return false;
+  const attempt = strict.attempt as Record<string, unknown>;
+  return (
+    typeof attempt.attemptId === "string" &&
+    Number.isInteger(attempt.candidateIndex) &&
+    typeof attempt.requestedModel === "string" &&
+    typeof attempt.outcome === "string" &&
+    typeof attempt.evidence === "object" &&
+    attempt.evidence !== null
   );
 }

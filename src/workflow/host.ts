@@ -35,12 +35,38 @@
 import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentManager } from "../agent-manager.js";
-import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
-import { resolveModel } from "../model-resolver.js";
+import {
+  buildAgentRegistry,
+  getAgentConfig,
+  resolveExactEnabledTypeIn,
+  resolveSpawnType,
+} from "../agent-types.js";
+import { loadCustomAgents } from "../custom-agents.js";
+import {
+  isExactQualifiedModelId,
+  resolveExactAvailableModel,
+  resolveModel,
+} from "../model-resolver.js";
 import { checkModelScope } from "../model-scope.js";
-import type { AgentRecord, ThinkingLevel } from "../types.js";
+import { strictPiCompatibilityError } from "../pi-compat.js";
+import { loadSettings } from "../settings.js";
+import {
+  emptyStrictExecutionEvidence,
+  type StrictAttemptFailureCode,
+  type StrictExecutionEvidence,
+  type StrictObservedEffort,
+} from "../strict-agent.js";
+import { sanitizeStrictDiagnostic } from "../strict-diagnostics.js";
+import type { AgentConfig, AgentRecord, ThinkingLevel } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
-import type { WorkflowGateResult, WorkflowHost, WorkflowSpawnResult } from "./runtime.js";
+import { isWorktreeIsolationEnabled } from "../worktree.js";
+import type {
+  WorkflowGateResult,
+  WorkflowHost,
+  WorkflowSpawnResult,
+  WorkflowStrictAttemptRequest,
+  WorkflowStrictAttemptResult,
+} from "./runtime.js";
 import { resolveWorkflowSource } from "./saved.js";
 
 /**
@@ -68,6 +94,8 @@ export interface WorkflowHostOptions {
    */
   workflowId?: string;
   gateTimeoutMs?: number;
+  /** Session-owned registry override, primarily for embedded hosts and tests. */
+  strictAgentRegistry?: Map<string, AgentConfig>;
 }
 
 /**
@@ -95,6 +123,35 @@ function childCwd(record: AgentRecord): string | undefined {
  */
 function succeeded(record: AgentRecord | undefined): boolean {
   return record?.status === "completed" || record?.status === "steered";
+}
+
+function snapshotStrictAgentRegistry(
+  registry: ReadonlyMap<string, AgentConfig>,
+): Map<string, AgentConfig> {
+  return new Map([...registry].map(([name, config]) => {
+    const clone: AgentConfig = {
+      ...config,
+      ...(config.builtinToolNames !== undefined
+        ? { builtinToolNames: [...config.builtinToolNames] }
+        : {}),
+      ...(config.extSelectors !== undefined ? { extSelectors: [...config.extSelectors] } : {}),
+      ...(config.disallowedTools !== undefined
+        ? { disallowedTools: [...config.disallowedTools] }
+        : {}),
+      ...(Array.isArray(config.extensions) ? { extensions: [...config.extensions] } : {}),
+      ...(config.excludeExtensions !== undefined
+        ? { excludeExtensions: [...config.excludeExtensions] }
+        : {}),
+      ...(Array.isArray(config.skills) ? { skills: [...config.skills] } : {}),
+      ...(Array.isArray(config.allowedSubagents)
+        ? { allowedSubagents: [...config.allowedSubagents] }
+        : {}),
+    };
+    for (const value of Object.values(clone)) {
+      if (Array.isArray(value)) Object.freeze(value);
+    }
+    return [name, Object.freeze(clone)];
+  }));
 }
 
 /** Translate a settled record into what the script sees. */
@@ -159,6 +216,17 @@ const GATE_SHELL: readonly [string, string] =
 
 export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
   const { pi, ctx, manager } = deps;
+  // Build from this session's cwd instead of the process-wide legacy registry.
+  // Concurrent SDK sessions therefore cannot redirect a strict role by being
+  // the last session to call registerAgents(). The snapshot stays fixed for the
+  // run, so edits on disk cannot change a route between fallback attempts.
+  const strictSettings = loadSettings(ctx.cwd);
+  const strictAgentRegistry = snapshotStrictAgentRegistry(
+    deps.strictAgentRegistry ?? buildAgentRegistry(
+      loadCustomAgents(ctx.cwd),
+      { disableDefaults: strictSettings.disableDefaultAgents === true },
+    ),
+  );
   /** Runtime agent id → the manager record it spawned. Never pruned mid-run. */
   const records = new Map<string, string>();
   /**
@@ -192,7 +260,256 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
     return { ok: result.code === 0, output };
   }
 
+  function strictFailureResult(
+    request: WorkflowStrictAttemptRequest,
+    code: StrictAttemptFailureCode,
+    message: unknown,
+    evidence: StrictExecutionEvidence,
+    observed?: { model?: string; effort?: StrictObservedEffort },
+  ): WorkflowStrictAttemptResult {
+    return {
+      attempt: {
+        attemptId: request.attemptId,
+        candidateIndex: request.candidateIndex,
+        requestedModel: request.model,
+        outcome: evidence.executionStarted
+          ? "post-execution-failure"
+          : "pre-execution-failure",
+        failure: { code, message: sanitizeStrictDiagnostic(message) },
+        evidence: { ...evidence },
+        ...(observed?.model !== undefined ? { observedModel: observed.model } : {}),
+        ...(observed?.effort !== undefined ? { observedEffort: observed.effort } : {}),
+      },
+      toolCalls: evidence.toolCallStartedCount,
+    };
+  }
+
   return {
+    validateStrictAgent(request) {
+      const compatibility = strictPiCompatibilityError(ctx.modelRegistry);
+      if (compatibility !== undefined) {
+        return {
+          ok: false,
+          failure: {
+            code: "INCOMPATIBLE_PI_RUNTIME",
+            message: sanitizeStrictDiagnostic(compatibility),
+          },
+        };
+      }
+      const candidates = [request.model, ...request.fallbackModels];
+      if (!candidates.every(isExactQualifiedModelId) || new Set(candidates).size !== candidates.length) {
+        return {
+          ok: false,
+          failure: {
+            code: "INVALID_MODEL_ID",
+            message: "Strict route candidates must be distinct exact provider/model ids.",
+          },
+        };
+      }
+      const agentType = /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(request.agentType)
+        ? resolveExactEnabledTypeIn(strictAgentRegistry, request.agentType)
+        : undefined;
+      if (agentType === undefined) {
+        return {
+          ok: false,
+          failure: {
+            code: "UNKNOWN_AGENT_TYPE",
+            message: sanitizeStrictDiagnostic(
+              `Unknown, disabled, or non-exact strict agent type: "${request.agentType}".`,
+            ),
+          },
+        };
+      }
+      const agentConfig = strictAgentRegistry.get(agentType);
+      if (request.isolation === "worktree" && agentConfig?.isolation === "off") {
+        return {
+          ok: false,
+          failure: {
+            code: "INVALID_ISOLATION",
+            message: `Strict agent type "${agentType}" refuses worktree isolation.`,
+          },
+        };
+      }
+      const isolation = request.isolation === "worktree" || agentConfig?.isolation === "worktree"
+        ? "worktree" as const
+        : undefined;
+      if (isolation === "worktree" && !isWorktreeIsolationEnabled()) {
+        return {
+          ok: false,
+          failure: {
+            code: "INVALID_ISOLATION",
+            message: "Strict worktree isolation is disabled for this project.",
+          },
+        };
+      }
+      return { ok: true, agentType, ...(isolation !== undefined ? { isolation } : {}) };
+    },
+
+    async spawnStrictAttempt(request) {
+      let evidence = emptyStrictExecutionEvidence();
+      let observed: { model?: string; effort?: StrictObservedEffort } = {};
+      let runtimeFailure: { code: StrictAttemptFailureCode; message: string } | undefined;
+      request.onEvidence?.(evidence);
+
+      const strictAgentConfig = strictAgentRegistry.get(request.agentType);
+      if (strictAgentConfig === undefined || strictAgentConfig.enabled === false) {
+        return strictFailureResult(
+          request,
+          "PREFLIGHT_FAILED",
+          `Strict agent type "${request.agentType}" is no longer available.`,
+          evidence,
+        );
+      }
+
+      const resolution = resolveExactAvailableModel(request.model, ctx.modelRegistry);
+      if (!resolution.ok) {
+        return strictFailureResult(
+          request,
+          resolution.code === "INVALID_MODEL_ID" ? "PREFLIGHT_FAILED" : resolution.code,
+          resolution.message,
+          evidence,
+        );
+      }
+
+      const scopeVerdict = checkModelScope({
+        model: resolution.model,
+        cwd: ctx.cwd,
+        modelRegistry: ctx.modelRegistry,
+        callerSupplied: true,
+        agentLabel: request.agentType,
+        modelInput: request.model,
+      });
+      if (scopeVerdict.kind === "error") {
+        return strictFailureResult(
+          request,
+          "MODEL_UNAVAILABLE",
+          scopeVerdict.message,
+          evidence,
+        );
+      }
+
+      let spawnedId: string | undefined;
+      try {
+        const { record } = await manager.spawnAndWait(
+          pi,
+          ctx,
+          request.agentType,
+          request.prompt,
+          {
+            description: request.agentType,
+            ...(deps.workflowId !== undefined ? { workflowId: deps.workflowId } : {}),
+            model: resolution.model,
+            agentConfigOverride: strictAgentConfig,
+            isolated: strictAgentConfig.isolated,
+            inheritContext: strictAgentConfig.inheritContext,
+            thinkingLevel: request.effort as ThinkingLevel,
+            invocation: { thinking: request.effort as ThinkingLevel },
+            strictAttempt: {
+              expectedModel: request.model,
+              expectedEffort: request.effort,
+              onObserved(info) {
+                observed = info;
+                request.onResolved?.({
+                  modelId: info.model,
+                  modelName: info.model,
+                  thinking: info.effort,
+                });
+              },
+              onEvidence(next) {
+                evidence = { ...next };
+                request.onEvidence?.(evidence);
+              },
+              onFailure(code, message) {
+                runtimeFailure ??= { code, message };
+              },
+            },
+            ...(request.schema !== undefined ? { structuredOutput: request.schema } : {}),
+            ...(request.isolation !== undefined ? { isolation: request.isolation } : {}),
+            ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
+            ...(deps.rootSessionId !== undefined ? { rootSessionId: deps.rootSessionId } : {}),
+          },
+          id => {
+            spawnedId = id;
+            records.set(request.agentId, id);
+            request.onResolved?.({ recordId: id });
+          },
+        );
+
+        const tokens = getLifetimeTotal(record.lifetimeUsage);
+        const outputTokens = record.lifetimeUsage?.output ?? 0;
+        const common = {
+          ...(tokens > 0 ? { tokens } : {}),
+          ...(outputTokens > 0 ? { outputTokens } : {}),
+          toolCalls: evidence.toolCallStartedCount,
+        };
+
+        if (runtimeFailure !== undefined) {
+          return {
+            ...common,
+            ...strictFailureResult(
+              request,
+              runtimeFailure.code,
+              runtimeFailure.message,
+              evidence,
+              observed,
+            ),
+          };
+        }
+        if (record.status === "stopped" || record.status === "aborted" || deps.signal?.aborted) {
+          return {
+            ...common,
+            ...strictFailureResult(
+              request,
+              "CANCELLED",
+              record.error ?? "Strict attempt cancelled.",
+              evidence,
+              observed,
+            ),
+          };
+        }
+        if (!succeeded(record)) {
+          return {
+            ...common,
+            ...strictFailureResult(
+              request,
+              evidence.executionStarted ? "CHILD_FAILED" : "PREFLIGHT_FAILED",
+              record.error ?? `Agent ${record.status}.`,
+              evidence,
+              observed,
+            ),
+          };
+        }
+
+        return {
+          ...common,
+          attempt: {
+            attemptId: request.attemptId,
+            candidateIndex: request.candidateIndex,
+            requestedModel: request.model,
+            ...(observed.model !== undefined ? { observedModel: observed.model } : {}),
+            ...(observed.effort !== undefined ? { observedEffort: observed.effort } : {}),
+            outcome: "selected",
+            evidence: { ...evidence },
+          },
+          text: record.structuredJson ?? record.result ?? "",
+          ...(record.structuredRetried ? { structuredRetried: true } : {}),
+        };
+      } catch (error) {
+        if (spawnedId !== undefined) records.set(request.agentId, spawnedId);
+        const code = runtimeFailure?.code
+          ?? (deps.signal?.aborted ? "CANCELLED"
+            : evidence.executionStarted ? "RUNTIME_FAILED"
+            : "PREFLIGHT_FAILED");
+        return strictFailureResult(
+          request,
+          code,
+          runtimeFailure?.message ?? error,
+          evidence,
+          observed,
+        );
+      }
+    },
+
     async spawnAgent(request) {
       const dispatch = resolveSpawnType(request.agentType);
       if (!dispatch.ok) return { ok: false, error: dispatch.message };
